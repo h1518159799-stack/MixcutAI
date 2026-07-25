@@ -1,0 +1,25 @@
+[Unit]
+Description=Mixcut AI License API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mixcut
+Group=mixcut
+UMask=0027
+WorkingDirectory=/opt/mixcut/server
+Environment=MIXCUT_DATA_DIR=/var/lib/mixcut
+Environment=MIXCUT_PRIVATE_KEY=/etc/mixcut/license_private_key.pem
+Environment=MIXCUT_PEPPER_FILE=/etc/mixcut/key_pepper
+ExecStart=/opt/mixcut/venv/bin/gunicorn --workers 2 --threads 2 --timeout 30 --bind 127.0.0.1:8000 license_server:app
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/mixcut
+
+[Install]
+WantedBy=multi-user.target

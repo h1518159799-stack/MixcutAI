@@ -1,0 +1,5 @@
+PyInstaller>=6.10,<7
+Pillow
+cryptography>=42,<46
+edge-tts>=7,<8
+playwright>=1.48,<2

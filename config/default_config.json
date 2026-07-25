@@ -1,0 +1,11 @@
+{
+  "product_name": "AI混剪软件",
+  "product_id": "mixcut-ai-windows",
+  "license_server_url": "",
+  "license_offline_grace_days": 3,
+  "license_expire_reminder_days": 7,
+  "ffmpeg_path": "",
+  "ffprobe_path": "",
+  "output_dir": "",
+  "work_dir": ""
+}

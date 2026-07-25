@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MixcutAI 授权中心</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div><strong>MixcutAI</strong><span>云端授权中心</span></div>
+    <form method="post" action="{{ url_for('admin_logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <span class="admin-name">{{ session.username }}</span><button class="ghost">退出</button>
+    </form>
+  </header>
+  <nav class="nav">
+    <a href="#overview">概览</a><a href="#licenses">卡密</a><a href="#customers">客户</a><a href="#devices">设备</a><a href="#logs">激活记录</a>
+  </nav>
+  <main class="container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="alert {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+
+    <section id="overview">
+      <div class="section-head"><div><h1>授权运营概览</h1><p>卡密、客户、设备与激活状态</p></div><span class="live"><i></i>服务运行中</span></div>
+      <div class="stats">
+        <article><span>客户总数</span><strong>{{ counts.customers }}</strong></article>
+        <article><span>授权总数</span><strong>{{ counts.licenses }}</strong></article>
+        <article><span>有效授权</span><strong>{{ counts.active }}</strong></article>
+        <article><span>绑定设备</span><strong>{{ counts.devices }}</strong></article>
+      </div>
+    </section>
+
+    <section id="licenses" class="panel">
+      <div class="panel-title"><div><h2>生成卡密</h2><p>卡密明文只在生成时显示一次</p></div></div>
+      <form method="post" action="{{ url_for('admin_license_generate') }}" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>客户<select name="customer_id"><option value="">未指定客户</option>{% for c in customers %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
+        <label>授权类型<select name="type"><option value="month">月卡</option><option value="year">年卡</option><option value="permanent">永久</option></select></label>
+        <label>设备数<input type="number" name="max_devices" min="1" max="20" value="1"></label>
+        <label>数量<input type="number" name="count" min="1" max="100" value="1"></label>
+        <button class="primary" type="submit">生成卡密</button>
+      </form>
+      {% if generated_keys %}<div class="key-result"><strong>新卡密，请立即保存：</strong><textarea readonly rows="{{ [generated_keys|length + 1, 8]|min }}">{{ generated_keys|join('\n') }}</textarea></div>{% endif %}
+      <div class="table-wrap">
+        <table><thead><tr><th>尾号</th><th>客户</th><th>类型</th><th>设备</th><th>到期时间</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>{% for l in licenses %}<tr>
+          <td><code>***{{ l.key_hint }}</code></td><td>{{ l.customer_name or '—' }}</td><td>{{ {'month':'月卡','year':'年卡','permanent':'永久'}.get(l.type,l.type) }}</td>
+          <td>{{ l.active_devices }}/{{ l.max_devices }}</td><td>{{ l.expire_date or '永久' }}</td><td><span class="badge {{ l.status }}">{{ l.status }}</span></td>
+          <td><form method="post" action="{{ url_for('admin_license_status', license_id=l.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% if l.status == 'frozen' %}<input type="hidden" name="status" value="active"><button class="small">解冻</button>{% else %}<input type="hidden" name="status" value="frozen"><button class="small danger">冻结</button>{% endif %}</form></td>
+        </tr>{% else %}<tr><td colspan="7" class="empty">暂无授权</td></tr>{% endfor %}</tbody></table>
+      </div>
+    </section>
+
+    <section id="customers" class="panel">
+      <div class="panel-title"><div><h2>客户管理</h2><p>建立授权与客户的归属关系</p></div></div>
+      <form method="post" action="{{ url_for('admin_customer_create') }}" class="inline-form customer-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>客户名称<input name="name" required placeholder="例如：广州某某公司"></label><label>公司<input name="company"></label>
+        <label>手机<input name="phone"></label><label>邮箱<input name="email" type="email"></label><label>备注<input name="notes"></label>
+        <button class="primary" type="submit">新增客户</button>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>客户</th><th>公司</th><th>手机</th><th>邮箱</th><th>状态</th><th>创建时间</th></tr></thead>
+        <tbody>{% for c in customers %}<tr><td>{{ c.name }}</td><td>{{ c.company or '—' }}</td><td>{{ c.phone or '—' }}</td><td>{{ c.email or '—' }}</td><td><span class="badge {{ c.status }}">{{ c.status }}</span></td><td>{{ c.created_at }}</td></tr>{% else %}<tr><td colspan="6" class="empty">暂无客户</td></tr>{% endfor %}</tbody></table></div>
+    </section>
+
+    <section id="devices" class="panel">
+      <div class="panel-title"><div><h2>设备绑定</h2><p>查看设备信息、IP和最近在线时间</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>客户</th><th>机器码</th><th>设备</th><th>系统</th><th>版本</th><th>IP</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>{% for d in devices %}<tr><td>{{ d.customer_name or '—' }}</td><td><code>{{ d.machine_id }}</code></td><td>{{ d.device_name or '—' }}</td><td>{{ d.os_info or '—' }}</td><td>{{ d.app_version or '—' }}</td><td>{{ d.last_ip }}</td><td><span class="badge {{ d.status }}">{{ d.status }}</span></td><td>{% if d.status == 'active' %}<form method="post" action="{{ url_for('admin_device_unbind', device_id=d.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="small danger">解绑</button></form>{% endif %}</td></tr>{% else %}<tr><td colspan="8" class="empty">暂无绑定设备</td></tr>{% endfor %}</tbody></table></div>
+    </section>
+
+    <section id="logs" class="panel">
+      <div class="panel-title"><div><h2>激活记录</h2><p>保留激活、校验、解绑结果与来源信息</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>时间</th><th>动作</th><th>结果</th><th>客户</th><th>机器码</th><th>IP</th><th>版本</th><th>说明</th></tr></thead>
+        <tbody>{% for a in logs %}<tr><td>{{ a.created_at }}</td><td>{{ a.action }}</td><td><span class="badge {{ a.result }}">{{ a.result }}</span></td><td>{{ a.customer_name or '—' }}</td><td><code>{{ a.machine_id }}</code></td><td>{{ a.ip_address }}</td><td>{{ a.app_version }}</td><td>{{ a.message or '—' }}</td></tr>{% else %}<tr><td colspan="8" class="empty">暂无记录</td></tr>{% endfor %}</tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>
+

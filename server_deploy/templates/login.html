@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MixcutAI 授权中心</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand-mark">M</div>
+    <h1>MixcutAI 云端授权</h1>
+    <p class="muted">管理员控制台</p>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="alert {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+    <form method="post" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
+      <label>管理员密码<input type="password" name="password" autocomplete="current-password" required></label>
+      <button class="primary" type="submit">登录授权中心</button>
+    </form>
+  </main>
+</body>
+</html>
+

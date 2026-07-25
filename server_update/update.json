@@ -1,0 +1,8 @@
+{
+    "version":  "1.3.6",
+    "title":  "Mixcut AI v1.3.6",
+    "content":  "Preserve final TTS tail, add configurable ending hold, and validate final audio-video duration",
+    "download_url":  "https://47-107-104-106.sslip.io/updates/MixcutAI.exe",
+    "sha256":  "7c433fcd9c1615b8821e496ba9dcddda2f1c8a05f5d939a43274fc0d095699a3",
+    "force_update":  false
+}

@@ -1,0 +1,43 @@
+{
+  "source_name": "mixcut.db",
+  "destination": "mixcut_sanitized.db",
+  "schema_version": 14,
+  "integrity_check": "ok",
+  "table_counts": {
+    "account_profiles": 0,
+    "ai_service_configs": 1,
+    "app_settings": 117,
+    "batch_task_items": 0,
+    "batch_tasks": 0,
+    "bgm_library": 0,
+    "edit_templates": 5,
+    "generation_shot_materials": 0,
+    "generation_tasks": 0,
+    "license_keys": 0,
+    "material_categories": 8,
+    "materials": 0,
+    "oauth_sessions": 0,
+    "oauth_tokens": 0,
+    "platform_test_runs": 0,
+    "platforms": 10,
+    "publish_accounts": 0,
+    "publish_channels": 0,
+    "publish_tasks": 0,
+    "scan_tasks": 0,
+    "shot_transitions": 0,
+    "sound_effect_library": 0,
+    "template_shots": 31,
+    "tts_service_configs": 1,
+    "tts_voices": 14
+  },
+  "removed": [
+    "OAuth Token/Session",
+    "发布账号",
+    "Cookie 与浏览器目录",
+    "API Key",
+    "客户账号档案",
+    "本地素材路径",
+    "卡密和许可证状态",
+    "生成输出路径"
+  ]
+}

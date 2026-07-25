@@ -1,0 +1,16 @@
+[
+  {"file":"01_click.mp3","name":"鼠标单击","category":"click","keywords":"点击,选择,确认,按钮,操作,鼠标,单击","duration":0.336,"volume":0.25},
+  {"file":"02_shine.mp3","name":"啵1","category":"shine","keywords":"展示,新品,升级,亮相,产品,高光,出现","duration":0.340,"volume":0.24},
+  {"file":"03_success.mp3","name":"回答正确","category":"success","keywords":"完成,正确,成功,达成,确认,结果","duration":0.366,"volume":0.25},
+  {"file":"04_whoosh.mp3","name":"唰","category":"whoosh","keywords":"切换,转场,进入,移动,快速,镜头,下一步","duration":0.470,"volume":0.24},
+  {"file":"05_notify.mp3","name":"嘟咚提示音","category":"notify","keywords":"提示,注意,重点,提醒,信息,通知","duration":0.653,"volume":0.23},
+  {"file":"06_comedy.mp3","name":"短放屁声","category":"comedy","keywords":"搞笑,尴尬,失败,翻车,错误","duration":0.810,"volume":0.20},
+  {"file":"07_shine.mp3","name":"轻气泡音","category":"shine","keywords":"展示,新品,亮相,产品,气泡,出现","duration":0.183,"volume":0.22},
+  {"file":"08_pop.mp3","name":"卡通弹跳音1","category":"pop","keywords":"弹出,出现,展示,卡通,轻松","duration":0.287,"volume":0.22},
+  {"file":"09_whoosh.mp3","name":"打响指","category":"whoosh","keywords":"切换,转场,改变,瞬间,重点","duration":0.313,"volume":0.24},
+  {"file":"10_pop.mp3","name":"卡通弹跳音2","category":"pop","keywords":"弹出,出现,展示,卡通,轻松","duration":0.340,"volume":0.22},
+  {"file":"11_impact.mp3","name":"拳击冲击","category":"impact","keywords":"冲击,重点,爆款,强调,震撼,实力","duration":0.366,"volume":0.26},
+  {"file":"12_warning.mp3","name":"系统警告","category":"warning","keywords":"警告,注意,问题,风险,错误,不能","duration":0.444,"volume":0.23},
+  {"file":"13_reaction.mp3","name":"哇呜","category":"reaction","keywords":"惊喜,厉害,震撼,没想到,亮点","duration":0.888,"volume":0.22},
+  {"file":"14_click.mp3","name":"滴提示音","category":"click","keywords":"点击,选择,确认,提示,操作,完成","duration":0.993,"volume":0.23}
+]
