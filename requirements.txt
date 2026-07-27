@@ -2,3 +2,4 @@ Pillow
 cryptography>=42,<46
 edge-tts>=7,<8
 playwright>=1.48,<2
+Flask>=3.1,<4

@@ -9,6 +9,5 @@
       "http://127.0.0.1:17866/api/oauth/callback"
     ]
   },
-  "说明": "字段结构示例。请从 Google Cloud 下载真实 Desktop OAuth JSON，并在新电脑重新授权；不要提交真实文件。"
+  "说明": "字段结构示例。请从 Google Cloud 下载真实 Desktop OAuth JSON，并在新电脑重新授权；不要提交真实凭据文件。"
 }
-

@@ -9,6 +9,5 @@
   "license_server_url": "",
   "update_manifest_url": "",
   "auto_check_update": false,
-  "说明": "复制后填写本机路径。不要写入 API Key、OAuth Token、Cookie 或许可证私钥。"
+  "说明": "复制后填写本机路径。不要写入 API Key OAuth Token Cookie 或许可证私钥。"
 }
-

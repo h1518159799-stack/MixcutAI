@@ -13,12 +13,16 @@ venv/
 node_modules/
 ui-commercial/dist/
 ui-commercial/.vite/
+cache/
+temp/
+tmp/
 
 # Build and release outputs
 build/
 release/
 admin_release/
 outputs/
+output/
 *.spec
 
 # Runtime data is machine/user bound. Only the sanitized backup is versioned.
@@ -27,9 +31,12 @@ data/
 *.db
 *.db-wal
 *.db-shm
-!backup_data_sanitized/*.db
 browser_profiles/
 playwright-browsers/
+data/cache/
+data/outputs/
+data/browser_profiles/
+data/logs/
 
 # Secrets and local authorization state
 .env
@@ -38,10 +45,16 @@ playwright-browsers/
 license.dat
 *.license
 *.key
+*.pem
+*.pfx
 **/*private*.pem
 **/cookies*.json
 **/storage_state*.json
 **/oauth_tokens*.json
+*client_secret*.json
+*credentials*.json
+*oauth*.json
+!oauth.example.json
 
 # Temporary files and logs
 *.log
@@ -60,3 +73,5 @@ qa/pyinstaller-license-contents.txt
 # Local backup products
 MixcutAI-source-*.zip
 MixcutAI-source-*.sha256.txt
+*.zip
+*.7z
