@@ -213,8 +213,18 @@ def log_event(conn: sqlite3.Connection, action: str, result: str, *, row: sqlite
            (license_id,customer_id,device_id,action,result,ip_address,user_agent,machine_id,app_version,message,created_at)
            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (license_id, customer_id, device_id, action, result, request_ip(),
-         str(request.headers.get("User-Agent") or "")[:300], machine_id[:64], app_version[:32], message[:500], iso_utc()),
+         str(request.headers.get("User-Agent") or "")[:300], mask_machine_id(machine_id), app_version[:32], message[:500], iso_utc()),
     )
+
+
+def mask_machine_id(value: str) -> str:
+    """Keep full machine IDs only in the devices binding table, never in logs."""
+    machine = str(value or "").strip()
+    if not machine:
+        return ""
+    if len(machine) <= 12:
+        return "***"
+    return f"{machine[:7]}...{machine[-5:]}"
 
 
 def issue_token(row: sqlite3.Row, machine_id: str) -> str:

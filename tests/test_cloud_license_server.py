@@ -64,7 +64,9 @@ class CloudLicenseServerTests(unittest.TestCase):
         self.assertEqual(deactivate.get_json()["data"]["status"], "deactivated")
         with self.server.connect() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM devices WHERE machine_id=?", (machine,)).fetchone()[0], 1)
-            self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM activation_logs WHERE machine_id=?", (machine,)).fetchone()[0], 3)
+            masked = self.server.mask_machine_id(machine)
+            self.assertGreaterEqual(conn.execute("SELECT COUNT(*) FROM activation_logs WHERE machine_id=?", (masked,)).fetchone()[0], 3)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM activation_logs WHERE machine_id=?", (machine,)).fetchone()[0], 0)
 
     def test_frozen_license_is_rejected(self):
         key = self.new_key("year")
@@ -85,4 +87,3 @@ class CloudLicenseServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
