@@ -436,6 +436,8 @@ def _init_db_impl():
                 success_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                technical_log_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 finished_at TEXT NOT NULL DEFAULT '',
@@ -448,6 +450,12 @@ def _init_db_impl():
                 platform_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 error_message TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                technical_log_id TEXT NOT NULL DEFAULT '',
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                video_file_hash TEXT NOT NULL DEFAULT '',
+                title_hash TEXT NOT NULL DEFAULT '',
+                result_evidence_json TEXT NOT NULL DEFAULT '{}',
                 remote_post_id TEXT NOT NULL DEFAULT '',
                 remote_url TEXT NOT NULL DEFAULT '',
                 started_at TEXT NOT NULL DEFAULT '',
@@ -531,6 +539,14 @@ def _init_db_impl():
         ensure_column(conn, "publish_tasks", "ai_hashtags", "TEXT NOT NULL DEFAULT '[]'")
         ensure_column(conn, "publish_tasks", "cover_text", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "ai_generated_time", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_tasks", "error_code", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_tasks", "technical_log_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "error_code", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "technical_log_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "video_file_hash", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "title_hash", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "result_evidence_json", "TEXT NOT NULL DEFAULT '{}'")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_generation_shot_materials_task_shot "
             "ON generation_shot_materials(task_id, shot_id)"
@@ -598,7 +614,10 @@ def _init_db_impl():
             "tts_enabled": "1",
             "default_tts_voice_id": "",
             "tts_speed": "1.0",
+            "tts_pitch": "0",
+            "tts_volume": "1.0",
             "tts_segment_gap_ms": "60",
+            "aliyun_bailian_sample_rate": "24000",
             "voice_volume": "1.0",
             "bgm_volume": "0.15",
             "subtitle_enabled": "1",
@@ -817,6 +836,21 @@ def _init_db_impl():
             conn.execute(
                 """UPDATE platforms SET capability_status_reason=?
                    WHERE code=? AND capability_status='untested' AND capability_status_reason=''""",
+                (reason, code),
+            )
+        # These four browser publishers have not completed a real publication
+        # acceptance run. Keep them gated regardless of adapter availability.
+        # Douyin is intentionally excluded and its passed status is untouched.
+        guarded_reasons = {
+            "kuaishou": "浏览器适配器已加异常保护，尚未完成真实发布验收",
+            "xiaohongshu": "浏览器适配器已加异常保护，尚未完成真实发布验收",
+            "wechat_channels": "浏览器适配器已加异常保护，尚未完成真实发布验收",
+            "bilibili": "浏览器适配器已加异常保护，尚未完成真实发布验收",
+        }
+        for code, reason in guarded_reasons.items():
+            conn.execute(
+                """UPDATE platforms SET capability_status='untested',capability_status_reason=?
+                   WHERE code=? AND last_tested_at='' AND capability_status<>'passed'""",
                 (reason, code),
             )
         _seed_default_sfx(conn)

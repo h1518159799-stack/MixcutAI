@@ -4,6 +4,8 @@ import random
 import json
 from pathlib import Path
 
+from runtime_paths import BUNDLED_FFMPEG_EXE
+
 from db import APP_DIR, connect, now
 from bgm_service import scan_bgm_folder
 from timeline_engine import TimelineError, build_color_filter, build_timeline_from_shots, render_timeline
@@ -20,6 +22,8 @@ class VideoGenerationError(RuntimeError):
 def find_ffmpeg(configured: str = "") -> str:
     if configured and Path(configured).exists():
         return configured
+    if BUNDLED_FFMPEG_EXE.is_file():
+        return str(BUNDLED_FFMPEG_EXE)
     found = shutil.which("ffmpeg")
     if found:
         return found

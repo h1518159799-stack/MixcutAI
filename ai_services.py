@@ -12,6 +12,7 @@ from pathlib import Path
 from db import APP_DIR, VOICE_DIR
 from tts_service import audio_duration
 from voice_clone_service import minimax_endpoint
+from aliyun_bailian_tts import synthesize as synthesize_bailian
 
 
 class ServiceError(RuntimeError):
@@ -173,6 +174,25 @@ def synthesize_tts(config: dict, voice: dict, text: str, shot_id: int, settings:
             raise ServiceError("MiniMax TTS 未返回有效音频") from exc
         output_mp3.write_bytes(audio_bytes)
         _convert_to_wav(output_mp3, output_wav, settings)
+    elif provider == "aliyun_bailian":
+        response_format = str(config.get("response_format") or "wav").lower()
+        if response_format not in {"mp3", "wav", "opus"}:
+            response_format = "wav"
+        raw_path = VOICE_DIR / f"shot_{shot_id}_bailian.{response_format}"
+        synthesize_bailian(
+            config,
+            text,
+            voice_code,
+            str(raw_path),
+            speed=max(0.5, min(2.0, float(speed or 1))),
+            volume=float(settings.get("tts_volume") or settings.get("voice_volume") or 1.0),
+            sample_rate=int(settings.get("aliyun_bailian_sample_rate") or 24000),
+            audio_format=response_format,
+        )
+        if response_format == "wav":
+            output_wav.write_bytes(raw_path.read_bytes())
+        else:
+            _convert_to_wav(raw_path, output_wav, settings)
     else:
         raise ServiceError(f"暂不支持的 TTS 服务类型：{provider}")
     duration = audio_duration(str(output_wav))
@@ -234,6 +254,6 @@ def concatenate_tts_wavs(paths: list[str], output_path: str, settings: dict, ret
     return str(output), duration
 
 
-def test_tts_service(config: dict, voice: dict, settings: dict) -> tuple[str, float]:
-    return synthesize_tts(config, voice, "这是语音服务连接测试。", 0, settings, 1.0)
+def test_tts_service(config: dict, voice: dict, settings: dict, text: str = "") -> tuple[str, float]:
+    return synthesize_tts(config, voice, text or "这是语音服务连接测试。", 0, settings, 1.0)
 from subprocess_utils import background_process_kwargs

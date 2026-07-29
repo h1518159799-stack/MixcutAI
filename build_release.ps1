@@ -1,4 +1,6 @@
-﻿$ErrorActionPreference = "Stop"
+﻿param([string]$FFmpegBin = "")
+
+$ErrorActionPreference = "Stop"
 
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = "C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
@@ -77,6 +79,24 @@ try {
     $BundledBrowserDir = Join-Path $StageDir "browser\chromium"
     New-Item -ItemType Directory -Path $BundledBrowserDir -Force | Out-Null
     Copy-Item -Path (Join-Path $ChromiumExe.Directory.FullName "*") -Destination $BundledBrowserDir -Recurse -Force
+    $FFmpegCandidates = @(
+        $FFmpegBin,
+        $env:FFMPEG_BIN,
+        (Join-Path $AppDir "vendor\ffmpeg\bin")
+    ) | Where-Object { $_ -and (Test-Path (Join-Path $_ "ffmpeg.exe")) -and (Test-Path (Join-Path $_ "ffprobe.exe")) }
+    if (-not $FFmpegCandidates) {
+        $PathFFmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+        if ($PathFFmpeg) { $FFmpegCandidates = @($PathFFmpeg.Source | Split-Path -Parent) }
+    }
+    $ResolvedFFmpegBin = $FFmpegCandidates | Select-Object -First 1
+    if (-not $ResolvedFFmpegBin) { throw "FFmpeg/FFprobe source not found. Pass -FFmpegBin <folder>." }
+    $BundledFFmpegDir = Join-Path $StageDir "runtime\ffmpeg\bin"
+    New-Item -ItemType Directory -Path $BundledFFmpegDir -Force | Out-Null
+    Copy-Item (Join-Path $ResolvedFFmpegBin "ffmpeg.exe") $BundledFFmpegDir -Force
+    Copy-Item (Join-Path $ResolvedFFmpegBin "ffprobe.exe") $BundledFFmpegDir -Force
+    foreach ($Document in @("README_使用说明.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt")) {
+        Copy-Item (Join-Path $AppDir $Document) (Join-Path $StageDir $Document) -Force
+    }
     $UserZip = "$ReleaseDir\MixcutAI-v$Version-win64.zip"
     @'
 import pathlib, sys, zipfile
@@ -101,15 +121,18 @@ with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compressleve
     @'
 import sys, zipfile
 path = sys.argv[1]
-allowed_root = {"MixcutAI.exe", "MixcutUpdater.exe", "default_config.json"}
+allowed_root = {"MixcutAI.exe", "MixcutUpdater.exe", "default_config.json", "README_\u4f7f\u7528\u8bf4\u660e.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt"}
 forbidden = (".py", ".db", ".log", ".env", ".key", ".pem", "license_admin", "production_test", "test_")
 with zipfile.ZipFile(path) as archive:
     names = [item.filename.replace("\\", "/").strip("/") for item in archive.infolist() if not item.is_dir()]
-unexpected = [name for name in names if name not in allowed_root and not name.startswith("browser/chromium/")]
+unexpected = [name for name in names if name not in allowed_root and not name.startswith("browser/chromium/") and not name.startswith("runtime/ffmpeg/")]
 if unexpected or not allowed_root.issubset(names):
     raise SystemExit(f"user package allowlist mismatch: {unexpected}")
 if "browser/chromium/chrome.exe" not in names:
     raise SystemExit("bundled Chromium executable missing")
+for binary in ("runtime/ffmpeg/bin/ffmpeg.exe", "runtime/ffmpeg/bin/ffprobe.exe"):
+    if binary not in names:
+        raise SystemExit(f"bundled media runtime missing: {binary}")
 if any(any(mark in name.lower() for mark in forbidden) for name in names):
     raise SystemExit(f"forbidden user package entry: {names}")
 print("PACKAGE_ALLOWLIST_OK", len(names), "files; bundled Chromium present")
@@ -131,6 +154,9 @@ print("PACKAGE_ALLOWLIST_OK", len(names), "files; bundled Chromium present")
         "  MixcutUpdater.exe",
         "  default_config.json",
         "  browser/chromium/ (bundled Chromium)",
+        "  runtime/ffmpeg/bin/ffmpeg.exe",
+        "  runtime/ffmpeg/bin/ffprobe.exe",
+        "  README_使用说明.txt / CHANGELOG.txt / LICENSE.txt / THIRD_PARTY_NOTICES.txt / VERSION.txt",
         "  混剪素材/",
         "    操作过程 / 产品 / 产品展示 / 店内环境 / 服务过程 / 空镜 / 门头 / 人物",
         "",

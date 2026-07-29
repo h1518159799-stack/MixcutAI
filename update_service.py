@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from db import DB_PATH
@@ -64,7 +64,7 @@ def current_version() -> str:
                 return str(value).strip()
         except (OSError, ValueError, TypeError):
             continue
-    return "1.3.4"
+    return "1.3.6"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -163,11 +163,21 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest().lower()
 
 
-def download_update(manifest: UpdateManifest, timeout: int = 60) -> Path:
+DownloadProgress = Callable[[int, int], None]
+
+
+def download_update(
+    manifest: UpdateManifest,
+    timeout: int = 60,
+    progress_callback: DownloadProgress | None = None,
+) -> Path:
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
     target = UPDATE_DIR / f"MixcutAI-{manifest.version}.exe"
     partial = target.with_suffix(".exe.part")
     if target.is_file() and sha256_file(target) == manifest.sha256:
+        if progress_callback:
+            size = target.stat().st_size
+            progress_callback(size, size)
         return target
     partial.unlink(missing_ok=True)
     downloaded = 0
@@ -184,6 +194,8 @@ def download_update(manifest: UpdateManifest, timeout: int = 60) -> Path:
                 if downloaded > MAX_UPDATE_BYTES:
                     raise UpdateError("新版安装文件超过大小限制")
                 output.write(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, content_length)
             output.flush()
             os.fsync(output.fileno())
     except UpdateError:
@@ -245,8 +257,11 @@ def launch_updater(new_exe: Path, manifest: UpdateManifest, database_backup: Pat
     return {"version": manifest.version, "staged_path": str(new_exe), "database_backup": str(database_backup)}
 
 
-def stage_and_launch(manifest: UpdateManifest) -> dict[str, str]:
-    new_exe = download_update(manifest)
+def stage_and_launch(
+    manifest: UpdateManifest,
+    progress_callback: DownloadProgress | None = None,
+) -> dict[str, str]:
+    new_exe = download_update(manifest, progress_callback=progress_callback)
     database_backup = backup_database()
     return launch_updater(new_exe, manifest, database_backup)
 
@@ -280,13 +295,46 @@ def startup_update_flow(config: dict[str, Any]) -> str:
     root.destroy()
     if not accepted:
         return "blocked" if manifest.force_update else "continue"
+    progress_root = tk.Tk()
+    progress_root.title("正在更新 MixcutAI")
+    progress_root.resizable(False, False)
+    from tkinter import ttk
+    frame = ttk.Frame(progress_root, padding=18)
+    frame.pack(fill="both", expand=True)
+    label = ttk.Label(frame, text="正在准备下载…")
+    label.pack(anchor="w", pady=(0, 10))
+    progress = ttk.Progressbar(frame, length=380, mode="determinate", maximum=100)
+    progress.pack(fill="x")
+    detail = ttk.Label(frame, text="0%")
+    detail.pack(anchor="e", pady=(8, 0))
+    progress_root.update_idletasks()
+    width, height = 430, 115
+    x = max(0, (progress_root.winfo_screenwidth() - width) // 2)
+    y = max(0, (progress_root.winfo_screenheight() - height) // 2)
+    progress_root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def report(downloaded: int, total: int) -> None:
+        if total > 0:
+            percent = min(100, int(downloaded * 100 / total))
+            progress["value"] = percent
+            detail.configure(text=f"{percent}%  {downloaded / 1048576:.1f} / {total / 1048576:.1f} MB")
+        else:
+            progress.configure(mode="indeterminate")
+            progress.start(12)
+            detail.configure(text=f"已下载 {downloaded / 1048576:.1f} MB")
+        label.configure(text="正在安全下载新版程序，请勿关闭软件")
+        progress_root.update_idletasks()
+        progress_root.update()
+
     try:
-        stage_and_launch(manifest)
+        stage_and_launch(manifest, progress_callback=report)
+        progress_root.destroy()
         return "launched"
     except UpdateError as exc:
-        root = tk.Tk(); root.withdraw()
-        messagebox.showerror("更新失败", str(exc), parent=root)
-        root.destroy()
+        progress_root.destroy()
+        error_root = tk.Tk(); error_root.withdraw()
+        messagebox.showerror("更新失败", str(exc), parent=error_root)
+        error_root.destroy()
         return "blocked" if manifest.force_update else "continue"
 
 

@@ -6,6 +6,7 @@ import wave
 from pathlib import Path
 
 from db import VOICE_DIR, connect
+from runtime_paths import BUNDLED_FFPROBE_EXE
 from subprocess_utils import background_process_kwargs
 
 
@@ -25,7 +26,7 @@ def clean_powershell_message(text: str) -> str:
 
 
 def find_ffprobe(configured: str = "") -> str:
-    candidates = [str(configured or "").strip()]
+    candidates = [str(configured or "").strip(), str(BUNDLED_FFPROBE_EXE)]
     try:
         with connect() as conn:
             row = conn.execute("SELECT value FROM app_settings WHERE key='ffprobe_path'").fetchone()

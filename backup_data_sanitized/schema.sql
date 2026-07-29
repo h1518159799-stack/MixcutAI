@@ -224,7 +224,7 @@ CREATE TABLE publish_channels (
                 started_at TEXT NOT NULL DEFAULT '',
                 finished_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, error_code TEXT NOT NULL DEFAULT '', technical_log_id TEXT NOT NULL DEFAULT '', idempotency_key TEXT NOT NULL DEFAULT '', video_file_hash TEXT NOT NULL DEFAULT '', title_hash TEXT NOT NULL DEFAULT '', result_evidence_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY(publish_task_id) REFERENCES publish_tasks(id) ON DELETE CASCADE,
                 FOREIGN KEY(account_id) REFERENCES publish_accounts(id) ON DELETE RESTRICT,
                 FOREIGN KEY(platform_id) REFERENCES platforms(id) ON DELETE RESTRICT,
@@ -247,7 +247,7 @@ CREATE TABLE publish_tasks (
                 last_error TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                finished_at TEXT NOT NULL DEFAULT '', ai_title TEXT NOT NULL DEFAULT '', ai_description TEXT NOT NULL DEFAULT '', ai_hashtags TEXT NOT NULL DEFAULT '[]', cover_text TEXT NOT NULL DEFAULT '', ai_generated_time TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT '', ai_title TEXT NOT NULL DEFAULT '', ai_description TEXT NOT NULL DEFAULT '', ai_hashtags TEXT NOT NULL DEFAULT '[]', cover_text TEXT NOT NULL DEFAULT '', ai_generated_time TEXT NOT NULL DEFAULT '', error_code TEXT NOT NULL DEFAULT '', technical_log_id TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(generation_task_id) REFERENCES generation_tasks(id) ON DELETE SET NULL
             );
 CREATE TABLE scan_tasks (

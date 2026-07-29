@@ -1,0 +1,14 @@
+第三方组件声明
+
+1. FFmpeg
+本软件随附独立 FFmpeg/FFprobe 可执行文件，用于视频和音频处理。当前构建来自 gyan.dev FFmpeg full build，并启用了 GPL 组件。
+FFmpeg 项目：https://ffmpeg.org/
+构建来源：https://www.gyan.dev/ffmpeg/builds/
+许可证与源码：https://ffmpeg.org/legal.html 和 https://ffmpeg.org/download.html
+
+2. Chromium
+本软件随附 Chromium 运行组件，用于独立浏览器登录环境。Chromium 及其第三方组件按 Chromium 分发目录内附带的许可文件提供。
+
+3. Python 第三方库
+软件使用 Pillow、cryptography、edge-tts、Playwright 等组件。组件版权归各自作者所有，并按各自许可证提供。
+

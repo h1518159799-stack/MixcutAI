@@ -14,6 +14,7 @@ from datetime import datetime
 from db import DATA_DIR, connect, now
 from publishers import get_publisher
 from publishers.youtube import verify_youtube_account
+from publish_safety import GUARDED_DOMESTIC_PLATFORMS, preflight_publish_check
 
 
 CAPABILITY_STATUSES = {"not_implemented", "untested", "testing", "passed", "failed", "limited"}
@@ -29,9 +30,13 @@ FIELD_SUPPORT = {
     "instagram": {"title": False, "description": True, "tags": True, "cover": True, "visibility": False, "schedule": False},
     "facebook": {"title": True, "description": True, "tags": True, "cover": True, "visibility": True, "schedule": True},
     "douyin": {"title": True, "description": True, "tags": True, "cover": True, "visibility": True, "schedule": True},
-    "xiaohongshu": {"title": True, "description": True, "tags": True, "cover": True, "visibility": True, "schedule": True},
-    "kuaishou": {"title": True, "description": True, "tags": True, "cover": True, "visibility": True, "schedule": True},
-    "wechat_channels": {"title": True, "description": True, "tags": True, "cover": True, "visibility": True, "schedule": True},
+    # These browser adapters currently fill the four fields below. Visibility
+    # and scheduling are deliberately reported as unsupported until real
+    # platform acceptance proves the corresponding controls and result state.
+    "xiaohongshu": {"title": True, "description": True, "tags": True, "cover": True, "visibility": False, "schedule": False},
+    "kuaishou": {"title": True, "description": True, "tags": True, "cover": True, "visibility": False, "schedule": False},
+    "wechat_channels": {"title": True, "description": True, "tags": True, "cover": True, "visibility": False, "schedule": False},
+    "bilibili": {"title": True, "description": True, "tags": True, "cover": True, "visibility": False, "schedule": False},
 }
 
 
@@ -166,6 +171,15 @@ def _execute_test(run_id: int, confirmations: dict):
             conn.execute("UPDATE platforms SET capability_status='testing',capability_status_reason='真实发布测试执行中',updated_at=? WHERE id=?", (now(), platform["id"]))
             conn.execute("UPDATE platform_test_runs SET status='testing',current_step='检查账号状态',started_at=?,report_path=?,updated_at=? WHERE id=?", (now(), str(artifact_dir / "report.json"), now(), run_id))
 
+        if platform["code"] in GUARDED_DOMESTIC_PLATFORMS:
+            preflight_publish_check(
+                platform, account, run["video_path"],
+                {"title": run["title"], "description": run["description"],
+                 "tags": json.loads(run["tags_json"] or "[]"), "cover_path": run["cover_path"],
+                 "schedule": run["scheduled_at"]},
+                allow_unverified=True, check_duplicate=False,
+            )
+
         def add(name, status, detail="", evidence=""):
             nonlocal step_clock
             current = time.monotonic()
@@ -215,6 +229,9 @@ def _execute_test(run_id: int, confirmations: dict):
             "tags": json.loads(run["tags_json"] or "[]"), "cover_path": run["cover_path"],
             "visibility": run["visibility"], "schedule": run["scheduled_at"],
             "test_mode": run["test_mode"], "artifact_dir": str(artifact_dir), "progress_callback": progress,
+            "acceptance_test": platform["code"] in GUARDED_DOMESTIC_PLATFORMS,
+            "confirm_submit": platform["code"] in GUARDED_DOMESTIC_PLATFORMS,
+            "partition_confirmed": bool(confirmations.get("partition_confirmed")),
         }
         result = get_publisher(platform["code"]).publish(run["video_path"], account, metadata) or {}
         if result.get("verified") is not True or not result.get("id") or not result.get("url"):

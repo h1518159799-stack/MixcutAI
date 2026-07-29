@@ -38,6 +38,8 @@ from browser_profile_service import (
 )
 from oauth_service import authorization_status, cancel_authorization, complete_authorization, start_authorization
 from oauth_token_store import protect
+from config_secret_store import encrypt_secret, public_service_config, runtime_service_config
+from aliyun_bailian_tts import list_voices as list_bailian_voices
 from platforms import adapter_catalog, get_adapter
 from publishers import publisher_catalog
 from publishers.youtube import verify_youtube_account
@@ -62,6 +64,27 @@ def row(sql: str, args=()):
     with connect() as conn:
         value = conn.execute(sql, args).fetchone()
         return dict(value) if value else None
+
+
+def runtime_config(table: str, record_id: int) -> dict | None:
+    if table not in {"ai_service_configs", "tts_service_configs"}:
+        raise ValueError("不支持的配置类型")
+    value = row(f"SELECT * FROM {table} WHERE id=?", (int(record_id),))
+    return runtime_service_config(value) if value else None
+
+
+def migrate_provider_secrets() -> None:
+    """Encrypt legacy plaintext provider keys in place with Windows DPAPI."""
+    with connect() as conn:
+        for table in ("ai_service_configs", "tts_service_configs"):
+            values = conn.execute(f"SELECT id,api_key FROM {table} WHERE COALESCE(api_key,'')<>''").fetchall()
+            for item in values:
+                stored = str(item["api_key"] or "")
+                if not stored.startswith("dpapi:"):
+                    conn.execute(
+                        f"UPDATE {table} SET api_key=?,updated_at=? WHERE id=?",
+                        (encrypt_secret(stored), now(), int(item["id"])),
+                    )
 
 
 def shot_script_text(shot: dict | None) -> str:
@@ -112,6 +135,7 @@ def resolve_tts_voice(cfg: dict, text: str = ""):
     if not voice:
         raise ValueError("没有可用的 TTS 音色")
     config = row("SELECT * FROM tts_service_configs WHERE id=? AND is_enabled=1", (voice["service_id"],))
+    config = runtime_service_config(config) if config else None
     if not config:
         raise ValueError("音色对应的 TTS 服务不可用")
     language = detect_text_language(text)
@@ -127,6 +151,7 @@ def resolve_tts_voice(cfg: dict, text: str = ""):
             if candidate:
                 voice = candidate
                 config = row("SELECT * FROM tts_service_configs WHERE id=? AND is_enabled=1", (voice["service_id"],))
+                config = runtime_service_config(config) if config else None
                 break
     return voice, config
 
@@ -430,8 +455,8 @@ def bootstrap():
     bgms = rows("SELECT * FROM bgm_library ORDER BY created_at DESC,id DESC")
     transitions = rows("SELECT * FROM shot_transitions ORDER BY from_shot_id,to_shot_id")
     sound_effects = rows("SELECT * FROM sound_effect_library ORDER BY category,name,id")
-    ai_services = rows("SELECT * FROM ai_service_configs ORDER BY is_default DESC,id")
-    tts_services = rows("SELECT * FROM tts_service_configs ORDER BY is_default DESC,id")
+    ai_services = [public_service_config(item) for item in rows("SELECT * FROM ai_service_configs ORDER BY is_default DESC,id")]
+    tts_services = [public_service_config(item) for item in rows("SELECT * FROM tts_service_configs ORDER BY is_default DESC,id")]
     tts_voices = rows("SELECT v.*,s.name service_name,s.provider FROM tts_voices v JOIN tts_service_configs s ON s.id=v.service_id ORDER BY s.is_default DESC,v.is_default DESC,v.id")
     platforms = rows("SELECT * FROM platforms ORDER BY CASE region WHEN 'domestic' THEN 0 ELSE 1 END,id")
     for platform in platforms:
@@ -609,7 +634,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console
 
 
 def clone_tts_voice(service_id: int, data: dict):
-    config = row("SELECT * FROM tts_service_configs WHERE id=?", (service_id,))
+    config = runtime_config("tts_service_configs", service_id)
     if not config or config.get("provider") != "minimax":
         raise ValueError("请选择 MiniMax 克隆语音服务")
     name = str(data.get("name") or "").strip()
@@ -735,6 +760,7 @@ def generate_profile_suggestions(data):
     if not brand_name or not industry or not product:
         raise ValueError("请先填写品牌名称 行业和产品介绍")
     config = row("SELECT * FROM ai_service_configs WHERE is_enabled=1 ORDER BY is_default DESC,id LIMIT 1")
+    config = runtime_service_config(config) if config else None
     if not config:
         raise ValueError("请先在系统设置中配置并启用 AI 服务")
     context = {
@@ -1010,7 +1036,10 @@ def generate_tts(shot_id: int):
 def save_ai_service(data):
     name = str(data.get("name") or "").strip()
     if not name: raise ValueError("AI 服务名称不能为空")
-    values = (name, str(data.get("provider") or "openai_compatible"), str(data.get("base_url") or ""), str(data.get("api_key") or ""), str(data.get("model") or ""), int(data.get("timeout_seconds") or 60), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0, str(data.get("system_prompt") or ""))
+    existing = row("SELECT api_key FROM ai_service_configs WHERE id=?", (int(data.get("id") or 0),)) if data.get("id") else None
+    submitted_key = str(data.get("api_key") or "").strip()
+    stored_key = encrypt_secret(submitted_key) if submitted_key else str((existing or {}).get("api_key") or "")
+    values = (name, str(data.get("provider") or "openai_compatible"), str(data.get("base_url") or ""), stored_key, str(data.get("model") or ""), int(data.get("timeout_seconds") or 60), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0, str(data.get("system_prompt") or ""))
     with connect() as conn:
         if values[7]: conn.execute("UPDATE ai_service_configs SET is_default=0")
         if data.get("id"):
@@ -1022,8 +1051,11 @@ def save_ai_service(data):
 
 def save_tts_service(data):
     name = str(data.get("name") or "").strip()
-    if not name: raise ValueError("TTS 服务名称不能为空")
-    values = (name, str(data.get("provider") or "edge_tts"), str(data.get("base_url") or ""), str(data.get("api_key") or ""), str(data.get("model") or ""), str(data.get("response_format") or "mp3"), int(data.get("timeout_seconds") or 120), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0)
+    if not name: raise ValueError("配音服务名称不能为空")
+    existing = row("SELECT api_key FROM tts_service_configs WHERE id=?", (int(data.get("id") or 0),)) if data.get("id") else None
+    submitted_key = str(data.get("api_key") or "").strip()
+    stored_key = encrypt_secret(submitted_key) if submitted_key else str((existing or {}).get("api_key") or "")
+    values = (name, str(data.get("provider") or "edge_tts"), str(data.get("base_url") or ""), stored_key, str(data.get("model") or ""), str(data.get("response_format") or "mp3"), int(data.get("timeout_seconds") or 120), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0)
     with connect() as conn:
         if values[8]: conn.execute("UPDATE tts_service_configs SET is_default=0")
         if data.get("id"):
@@ -1031,6 +1063,29 @@ def save_tts_service(data):
             return int(data["id"])
         conn.execute("INSERT INTO tts_service_configs(name,provider,base_url,api_key,model,response_format,timeout_seconds,is_enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (*values, now(), now()))
         return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def sync_tts_voices(service_id: int) -> dict:
+    config = runtime_config("tts_service_configs", service_id)
+    if not config:
+        raise ValueError("配音服务不存在")
+    if config.get("provider") != "aliyun_bailian":
+        raise ValueError("当前服务不支持同步音色")
+    voices = list_bailian_voices(config)
+    with connect() as conn:
+        for index, voice in enumerate(voices):
+            existing = conn.execute(
+                "SELECT id FROM tts_voices WHERE service_id=? AND voice_code=?",
+                (service_id, voice["voice_code"]),
+            ).fetchone()
+            if existing:
+                conn.execute("UPDATE tts_voices SET name=?,updated_at=? WHERE id=?", (voice["name"], now(), existing["id"]))
+            else:
+                conn.execute(
+                    "INSERT INTO tts_voices(service_id,name,voice_code,is_default,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (service_id, voice["name"], voice["voice_code"], 1 if index == 0 else 0, now(), now()),
+                )
+    return {"total": len(voices)}
 
 
 def save_tts_voice(data):
@@ -1055,6 +1110,7 @@ def rewrite_shot(
     shot = row("SELECT * FROM template_shots WHERE id=?", (shot_id,))
     if not shot: raise ValueError("镜头不存在")
     config = row("SELECT * FROM ai_service_configs WHERE is_enabled=1 ORDER BY is_default DESC,id LIMIT 1")
+    config = runtime_service_config(config) if config else None
     if not config: raise ValueError("请先在设置中配置并启用 AI 服务")
     profile = row("SELECT * FROM account_profiles WHERE id=?", (profile_id,)) if profile_id else row("SELECT * FROM account_profiles ORDER BY updated_at DESC,id DESC LIMIT 1")
     profile = profile or {}
@@ -1114,6 +1170,7 @@ def rewrite_template_shots(
     if not shots:
         return []
     config = row("SELECT * FROM ai_service_configs WHERE is_enabled=1 ORDER BY is_default DESC,id LIMIT 1")
+    config = runtime_service_config(config) if config else None
     if not config:
         raise ValueError("请先在设置中配置并启用 AI 服务")
     profile = row("SELECT * FROM account_profiles WHERE id=?", (profile_id,)) if profile_id else row(
@@ -1447,7 +1504,7 @@ class CommercialHandler(SimpleHTTPRequestHandler):
             if parsed.path == "/api/update/status":
                 return self.json_response({"ok": True, "data": update_status()})
             if parsed.path == "/api/publish/capabilities":
-                return self.json_response({"ok": True, "data": {**publishing_capabilities(), "adapters": adapter_catalog(), "publishers": publisher_catalog()}})
+                return self.json_response({"ok": True, "data": {**publishing_capabilities(), "adapters": adapter_catalog(), "publishers": publisher_catalog(include_guarded=True)}})
             if parsed.path == "/api/oauth/callback":
                 query = parse_qs(parsed.query)
                 if query.get("error"):
@@ -1467,6 +1524,8 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 with file_path.open("rb") as f:
                     while chunk := f.read(1024 * 1024): self.wfile.write(chunk)
                 return
+            if parsed.path == "/settings" or parsed.path.startswith("/settings/"):
+                self.path = "/index.html"
             return super().do_GET()
         except Exception as exc:
             return self.json_response({"ok": False, "error": str(exc), "trace": traceback.format_exc()}, 500)
@@ -1506,7 +1565,11 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = True
             elif parsed.path == "/api/profiles": result = {"id": save_profile(data)}
             elif parsed.path == "/api/publish/accounts": result = {"id": save_publishing_account(data)}
-            elif parsed.path == "/api/publish/tasks": result = {"id": create_publish_task(data), "status": "pending"}
+            elif parsed.path == "/api/publish/tasks":
+                publish_task_id = create_publish_task(data)
+                with connect() as conn:
+                    publish_task = conn.execute("SELECT status FROM publish_tasks WHERE id=?", (publish_task_id,)).fetchone()
+                result = {"id": publish_task_id, "status": publish_task["status"] if publish_task else "pending"}
             elif parsed.path == "/api/publish/sync-output": result = sync_missing_publish_videos()
             elif parsed.path == "/api/platform-tests": result = {"id": create_platform_test(data), "status": "pending"}
             elif re.fullmatch(r"/api/platform-tests/\d+/retry", parsed.path):
@@ -1530,12 +1593,29 @@ class CommercialHandler(SimpleHTTPRequestHandler):
             elif parsed.path == "/api/profiles/ai-suggestions": result = generate_profile_suggestions(data)
             elif parsed.path == "/api/ai-services": result = {"id": save_ai_service(data)}
             elif re.fullmatch(r"/api/ai-services/\d+/test", parsed.path):
-                config = row("SELECT * FROM ai_service_configs WHERE id=?", (int(parsed.path.split("/")[3]),)); result = {"message": test_ai_service(config or {})}
+                config = runtime_config("ai_service_configs", int(parsed.path.split("/")[3])); result = {"message": test_ai_service(config or {})}
+            elif parsed.path == "/api/tts-services/test-config":
+                config = dict(data.get("config") or {})
+                if config.get("id") and not str(config.get("api_key") or "").strip():
+                    stored = runtime_config("tts_service_configs", int(config["id"])) or {}
+                    stored.update({key: value for key, value in config.items() if key != "api_key"})
+                    config = stored
+                provider = str(config.get("provider") or "")
+                if provider == "aliyun_bailian":
+                    voice_info = list_bailian_voices(config)[0]
+                    voice = {"voice_code": str(data.get("voice_code") or voice_info["voice_code"])}
+                else:
+                    voice = row("SELECT * FROM tts_voices WHERE service_id=? ORDER BY is_default DESC,id LIMIT 1", (int(config.get("id") or 0),))
+                if not voice: raise ValueError("请先配置一个可用音色")
+                path, duration = test_tts_service(config, voice, settings(), str(data.get("text") or ""))
+                result = {"voice_file_path": path, "duration": duration, "voice_url": media_url(path)}
             elif parsed.path == "/api/tts-services": result = {"id": save_tts_service(data)}
             elif re.fullmatch(r"/api/tts-services/\d+/test", parsed.path):
-                service_id = int(parsed.path.split("/")[3]); config = row("SELECT * FROM tts_service_configs WHERE id=?", (service_id,)); voice = row("SELECT * FROM tts_voices WHERE service_id=? ORDER BY is_default DESC,id LIMIT 1", (service_id,))
+                service_id = int(parsed.path.split("/")[3]); config = runtime_config("tts_service_configs", service_id); voice = row("SELECT * FROM tts_voices WHERE service_id=? ORDER BY is_default DESC,id LIMIT 1", (service_id,))
                 if not config or not voice: raise ValueError("TTS 服务不存在或尚未配置音色")
-                path, duration = test_tts_service(config, voice, settings()); result = {"voice_file_path": path, "duration": duration}
+                path, duration = test_tts_service(config, voice, settings(), str(data.get("text") or "")); result = {"voice_file_path": path, "duration": duration, "voice_url": media_url(path)}
+            elif re.fullmatch(r"/api/tts-services/\d+/voices/sync", parsed.path):
+                result = sync_tts_voices(int(parsed.path.split("/")[3]))
             elif re.fullmatch(r"/api/tts-services/\d+/clone", parsed.path):
                 result = clone_tts_voice(int(parsed.path.split("/")[3]), data)
             elif parsed.path == "/api/tts-voices": result = {"id": save_tts_voice(data)}
@@ -1626,6 +1706,7 @@ class CommercialHandler(SimpleHTTPRequestHandler):
 
 def prepare():
     init_db()
+    migrate_provider_secrets()
     cfg = settings()
     output = cfg.get("output_dir", "")
     if not output or not Path(output).parent.exists():

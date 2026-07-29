@@ -31,7 +31,7 @@ from runtime_paths import CONFIG_DIR, DATA_DIR
 
 
 PRODUCT_ID = "mixcut-ai-windows"
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.6"
 TOKEN_PREFIX = "MXLIC1"
 VALID_TYPES = {"month", "year", "permanent"}
 PUBLIC_KEY_B64 = "FS/YNzoWyelZRmfTJq7yZxFYnsjY8mlMha6XHofb4Qk="
@@ -188,9 +188,20 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int = 12) -> dict[str
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "ignore")
-        raise ValueError(f"授权服务器返回 HTTP {exc.code}: {detail[:180]}") from exc
+        try:
+            payload = json.loads(detail)
+            message = str(payload.get("error") or payload.get("message") or "").strip()
+        except (ValueError, TypeError):
+            message = ""
+        if exc.code == 404:
+            message = message or "卡密不存在"
+        elif exc.code == 429:
+            message = message or "请求过于频繁，请稍后重试"
+        elif exc.code >= 500:
+            message = "授权服务器暂时不可用，请稍后重试"
+        raise ValueError(message or f"授权请求失败（HTTP {exc.code}）") from exc
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise ConnectionError(f"无法连接授权服务器: {exc}") from exc
+        raise ConnectionError("授权服务器暂时不可用，请检查网络后重试") from exc
     if not result.get("ok", True):
         raise ValueError(str(result.get("error") or result.get("message") or "授权请求失败"))
     return result.get("data", result)

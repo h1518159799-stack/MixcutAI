@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 
 from db import THUMB_DIR
+from runtime_paths import BUNDLED_FFMPEG_EXE, BUNDLED_FFPROBE_EXE
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg"}
 
@@ -16,6 +17,9 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v", "
 def find_executable(name: str, configured: str = "") -> Optional[str]:
     if configured and Path(configured).exists():
         return configured
+    bundled = BUNDLED_FFPROBE_EXE if name.lower().startswith("ffprobe") else BUNDLED_FFMPEG_EXE
+    if bundled.is_file():
+        return str(bundled)
     return shutil.which(name)
 
 

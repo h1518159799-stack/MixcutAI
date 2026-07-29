@@ -15,7 +15,10 @@ from pathlib import Path
 from commercial_api import CommercialHandler, prepare
 from activation_window import require_activation, show_expiry_reminder
 from db import connect
-from runtime_paths import APP_HOME, DATA_DIR, RESOURCE_DIR, ensure_material_workspace, ensure_runtime_dirs
+from runtime_paths import (
+    APP_HOME, DATA_DIR, RESOURCE_DIR, BUNDLED_FFMPEG_EXE,
+    ensure_material_workspace, ensure_runtime_dirs,
+)
 from browser_profile_service import find_chromium
 from update_service import startup_update_flow
 from splash_window import SplashWindow
@@ -43,7 +46,11 @@ def warn_missing_ffmpeg() -> None:
     with connect() as conn:
         row = conn.execute("SELECT value FROM app_settings WHERE key='ffmpeg_path'").fetchone()
     configured = str(row[0] if row else "").strip()
-    available = bool(configured and Path(configured).is_file()) or bool(shutil.which("ffmpeg"))
+    available = (
+        bool(configured and Path(configured).is_file())
+        or BUNDLED_FFMPEG_EXE.is_file()
+        or bool(shutil.which("ffmpeg"))
+    )
     (DATA_DIR / "preflight.json").write_text(
         json.dumps({"ffmpeg_available": available, "configured_path": configured}, ensure_ascii=False),
         encoding="utf-8",

@@ -302,6 +302,11 @@ def run_production_test(emit=None):
 
         with log.step("匹配素材") as step:
             with connect() as conn:
+                task_id = conn.execute(
+                    """INSERT INTO generation_tasks(template_id,task_name,status,progress,current_shot,total_shots,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (template_id, "生产测试任务", "pending", 0, "等待开始", 3, now(), now()),
+                ).lastrowid
                 used = set()
                 for sid, text, dur, freq, cat in shot_ids:
                     shot = conn.execute("SELECT voice_duration FROM template_shots WHERE id=?", (sid,)).fetchone()
@@ -313,20 +318,14 @@ def run_production_test(emit=None):
                     start = 1.0
                     end = round(start + vd, 3)
                     conn.execute(
-                        """INSERT INTO generation_shot_materials(shot_id,material_id,voice_duration,material_start_time,material_end_time,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?,?)""",
-                        (sid, mid, vd, start, end, now(), now()),
+                        """INSERT INTO generation_shot_materials(task_id,shot_id,material_id,voice_duration,material_start_time,material_end_time,created_at,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        (task_id, sid, mid, vd, start, end, now(), now()),
                     )
                     used.add(mid)
             step.ok("3个镜头均已匹配素材并保存裁剪区间")
 
         with log.step("创建生成任务并合成最终 MP4") as step:
-            with connect() as conn:
-                task_id = conn.execute(
-                    """INSERT INTO generation_tasks(template_id,task_name,status,progress,current_shot,total_shots,created_at,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (template_id, "生产测试任务", "pending", 0, "等待开始", 3, now(), now()),
-                ).lastrowid
             output_dir = get_setting("output_dir") or str(APP_DIR / "outputs")
             final_output = generate_video(task_id, template_id, ffmpeg, output_dir)
             step.ok(f"输出：{final_output}")
@@ -337,7 +336,9 @@ def run_production_test(emit=None):
             streams = info.get("streams", [])
             video = next((s for s in streams if s.get("codec_type") == "video"), {})
             audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
-            expected = sum(s[2] for s in shot_ids)
+            end_hold = float(get_setting("end_hold_duration") or 0.8)
+            inter_shot = max(0.1, min(0.2, float(get_setting("inter_shot_audio_safety") or 0.15)))
+            expected = sum(s[2] for s in shot_ids) + inter_shot * (len(shot_ids) - 1) + end_hold
             checks = {
                 "duration": duration,
                 "expected_duration": expected,
@@ -352,7 +353,7 @@ def run_production_test(emit=None):
                 raise RuntimeError(f"音频编码不是 aac：{checks}")
             if int(video.get("width") or 0) != 1080 or int(video.get("height") or 0) != 1920:
                 raise RuntimeError(f"分辨率不是 1080x1920：{checks}")
-            if abs(duration - expected) > 1.0:
+            if abs(duration - expected) > 0.20:
                 raise RuntimeError(f"音视频总时长偏差过大：{checks}")
             step.ok("输出视频 ffprobe 检查通过", checks)
 
