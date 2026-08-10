@@ -463,8 +463,8 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
             task_id,
             status="failed",
             current_stage="publish_registration",
-            current_step="??????",
-            current_shot="??????",
+            current_step="登记发布记录",
+            current_shot="登记发布记录",
             error_code="PUBLISH_REGISTRATION_FAILED",
             error_message=str(exc),
             failed_stage="publish_registration",
@@ -472,8 +472,8 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
         )
         raise VideoGenerationError(str(exc)) from exc
     heartbeat(
-        task_id, status="succeeded", stage="succeeded", step="??", progress=100,
-        log=f"?????{final_path}",
+        task_id, status="succeeded", stage="succeeded", step="完成", progress=100,
+        log=f"成片生成完成：{final_path}",
     )
     return str(final_path)
 from subprocess_utils import background_process_kwargs

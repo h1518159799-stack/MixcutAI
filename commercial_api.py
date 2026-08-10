@@ -444,25 +444,25 @@ def delete_account_group(group_id: int) -> None:
             "UPDATE publish_account_groups SET enabled=0,updated_at=? WHERE id=? AND enabled=1",
             (now(), group_id),
         ).rowcount != 1:
-            raise ValueError("???????")
+            raise ValueError("账号分组不存在")
         conn.execute("DELETE FROM publish_account_group_members WHERE group_id=?", (group_id,))
 
 
 def _group_member_gate(account: dict) -> tuple[bool, str, str]:
     capability = str(account.get("capability_status") or "untested")
     if capability == "untested":
-        return False, "PLATFORM_UNTESTED", "??????????"
+        return False, "PLATFORM_UNTESTED", "平台尚未完成真实验收"
     if capability == "failed":
-        return False, "PLATFORM_FAILED", "??????"
+        return False, "PLATFORM_FAILED", "平台验收失败"
     if capability == "limited":
-        return False, "PLATFORM_LIMITED", "???????????"
+        return False, "PLATFORM_LIMITED", "平台当前仅支持部分功能"
     if capability != "passed":
-        return False, "PLATFORM_UNTESTED", "??????????"
+        return False, "PLATFORM_UNTESTED", "平台尚未完成真实验收"
     if str(account.get("integration_type") or "browser") == "api":
         if str(account.get("authorization_status") or "") != "authorized":
-            return False, "OAUTH_EXPIRED", "OAuth?????"
+            return False, "OAUTH_EXPIRED", "OAuth授权已失效"
     elif str(account.get("login_status") or "") != "logged_in":
-        return False, "AUTH_EXPIRED", "??????"
+        return False, "AUTH_EXPIRED", "账号尚未登录"
     return True, "", ""
 
 
@@ -490,10 +490,10 @@ def group_publish_preflight(data: dict) -> dict:
     group_id = int(data.get("group_id") or 0)
     group = row("SELECT * FROM publish_account_groups WHERE id=? AND enabled=1", (group_id,))
     if not group:
-        raise ValueError("???????")
+        raise ValueError("账号分组不存在")
     members = _group_members(group_id, data.get("selected_account_ids"))
     if not members:
-        raise ValueError("????????")
+        raise ValueError("分组内没有可用账号")
     publishable = [item for item in members if item["publishable"]]
     blocked = [item for item in members if not item["publishable"]]
     return {
