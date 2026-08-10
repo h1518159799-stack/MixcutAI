@@ -1,6 +1,5 @@
 import json
 import math
-import shutil
 import subprocess
 import time
 import wave
@@ -10,6 +9,7 @@ from db import APP_DIR, DATA_DIR, THUMB_DIR, VOICE_DIR, connect, now
 from subtitle_service import generate_ass_for_shot
 from video_engine import generate_video
 from video_scan import make_thumbnail, probe_video, quick_hash
+from runtime_paths import get_ffmpeg_path, get_ffprobe_path
 
 TEST_ROOT = DATA_DIR / "production_tests"
 
@@ -91,12 +91,6 @@ def get_setting(key):
     with connect() as conn:
         r = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
         return r["value"] if r else ""
-
-
-def find_binary(name, configured=""):
-    if configured and Path(configured).exists():
-        return configured
-    return shutil.which(name) or ""
 
 
 def run_cmd(cmd, timeout=120):
@@ -223,12 +217,8 @@ def run_production_test(emit=None):
     final_error = ""
     try:
         with log.step("检查 FFmpeg / FFprobe") as step:
-            ffmpeg = find_binary("ffmpeg", get_setting("ffmpeg_path"))
-            ffprobe = find_binary("ffprobe", get_setting("ffprobe_path"))
-            if not ffmpeg:
-                raise RuntimeError("FFmpeg 不可用：请在【设置】配置 ffmpeg.exe")
-            if not ffprobe:
-                raise RuntimeError("FFprobe 不可用：请在【设置】配置 ffprobe.exe")
+            ffmpeg = get_ffmpeg_path()
+            ffprobe = get_ffprobe_path()
             step.ok(f"ffmpeg={ffmpeg}; ffprobe={ffprobe}")
 
         material_dir = log.run_dir / "materials"

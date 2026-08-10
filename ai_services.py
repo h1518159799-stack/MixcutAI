@@ -3,20 +3,45 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import time
 import urllib.error
 import urllib.request
 import wave
 from array import array
 from pathlib import Path
 
-from db import APP_DIR, VOICE_DIR
+from db import APP_DIR, VOICE_DIR, connect
+from config_secret_store import runtime_service_config
 from tts_service import audio_duration
 from voice_clone_service import minimax_endpoint
 from aliyun_bailian_tts import synthesize as synthesize_bailian
+from runtime_paths import MediaRuntimeError, get_ffmpeg_path
 
 
 class ServiceError(RuntimeError):
     pass
+
+
+def get_active_text_ai_config() -> dict:
+    """Return the single active text-AI configuration for backend use only.
+
+    The API key is decrypted here and this object must never be serialized to
+    the frontend.  Keeping this lookup next to ``chat_completion`` prevents
+    feature pages from inventing their own provider/configuration path.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT * FROM ai_service_configs
+               WHERE is_enabled=1
+               ORDER BY is_default DESC,id
+               LIMIT 1"""
+        ).fetchone()
+    if not row:
+        raise ServiceError("AI_TEXT_SERVICE_NOT_CONFIGURED")
+    config = runtime_service_config(dict(row))
+    if not str(config.get("api_key") or "").strip():
+        raise ServiceError("AI_TEXT_SERVICE_NOT_CONFIGURED")
+    return config
 
 
 def _endpoint(base_url: str, suffix: str) -> str:
@@ -75,8 +100,10 @@ def test_ai_service(config: dict) -> str:
 
 
 def _ffmpeg_path(settings: dict) -> str:
-    configured = str(settings.get("ffmpeg_path") or "")
-    return configured if configured and Path(configured).exists() else "ffmpeg"
+    try:
+        return get_ffmpeg_path()
+    except MediaRuntimeError as exc:
+        raise ServiceError(str(exc)) from exc
 
 
 def _convert_to_wav(source: Path, output: Path, settings: dict):
@@ -86,20 +113,40 @@ def _convert_to_wav(source: Path, output: Path, settings: dict):
         raise ServiceError("FFmpeg 无法转换外部 TTS 音频")
 
 
-def _synthesize_edge_tts(text: str, voice_code: str, rate: int, output_mp3: Path, timeout: int) -> None:
+def _synthesize_edge_tts(text: str, voice_code: str, rate: int, output_mp3: Path, timeout: int,
+                         attempts: int = 3) -> None:
     """Run bundled edge-tts directly; release builds do not require Python."""
-    try:
-        import edge_tts
+    import edge_tts
 
-        async def generate() -> None:
-            communicate = edge_tts.Communicate(text=text, voice=voice_code, rate=f"{rate:+d}%")
-            await communicate.save(str(output_mp3))
+    last_error: Exception | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        output_mp3.unlink(missing_ok=True)
+        try:
+            async def generate() -> None:
+                communicate = edge_tts.Communicate(text=text, voice=voice_code, rate=f"{rate:+d}%")
+                await communicate.save(str(output_mp3))
 
-        asyncio.run(asyncio.wait_for(generate(), timeout=max(30, timeout)))
-    except Exception as exc:
-        raise ServiceError(f"Edge TTS 生成失败：{exc}") from exc
-    if not output_mp3.exists() or output_mp3.stat().st_size == 0:
-        raise ServiceError("Edge TTS 未生成有效音频")
+            asyncio.run(asyncio.wait_for(generate(), timeout=max(30, timeout)))
+            if output_mp3.exists() and output_mp3.stat().st_size > 512:
+                return
+            raise RuntimeError("未生成有效音频文件")
+        except asyncio.CancelledError as exc:
+            # Python 3.12 treats CancelledError as BaseException.  Converting it
+            # here prevents a TTS cancellation from silently killing the whole
+            # generation worker without writing a failed status.
+            last_error = RuntimeError("Edge TTS 请求被中断或超时")
+            output_mp3.unlink(missing_ok=True)
+            if attempt < attempts:
+                time.sleep(min(2.0, 0.5 * attempt))
+        except Exception as exc:
+            last_error = exc
+            output_mp3.unlink(missing_ok=True)
+            if attempt < attempts:
+                time.sleep(min(2.0, 0.5 * attempt))
+    raise ServiceError(
+        f"Edge TTS 连续 {attempts} 次未返回有效音频：{last_error}。"
+        "请检查网络后重试，或在系统设置中切换 MiniMax、阿里云百炼等配音服务。"
+    ) from last_error
 
 
 def synthesize_tts(config: dict, voice: dict, text: str, shot_id: int, settings: dict, speed: float = 1.0) -> tuple[str, float]:

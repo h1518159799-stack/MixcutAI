@@ -5,7 +5,11 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from timeline_engine import TRANSITION_FILTERS, build_timeline_from_shots
+from timeline_engine import (
+    TRANSITION_FILTERS,
+    build_timeline_from_shots,
+    concat_segments_with_transitions,
+)
 
 
 class TimelineTransitionSfxTests(unittest.TestCase):
@@ -92,6 +96,33 @@ class TimelineTransitionSfxTests(unittest.TestCase):
             {"fade", "slide_left", "slide_right", "zoom", "flash", "blur"}
             <= set(TRANSITION_FILTERS)
         )
+
+    def test_disabled_transition_is_a_hard_cut_not_sub_frame_xfade(self):
+        captured = []
+        transitions = [
+            {"effect": "fade", "duration": 0.4, "enabled": True},
+            {"effect": "fade", "duration": 0.001, "enabled": False},
+        ]
+        with (
+            patch("timeline_engine.probe_duration", side_effect=[2.0, 3.0, 4.0]),
+            patch("timeline_engine.run_ffmpeg", side_effect=lambda cmd: captured.append(cmd)),
+        ):
+            concat_segments_with_transitions(
+                "ffmpeg",
+                ["one.mp4", "two.mp4", "three.mp4"],
+                transitions,
+                "output.mp4",
+                ".",
+            )
+
+        command = captured[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=fade:duration=0.400", graph)
+        self.assertIn("[v1][vin2]concat=n=2:v=1:a=0[v2]", graph)
+        self.assertIn("[a1][ain2]concat=n=2:v=0:a=1[a2]", graph)
+        self.assertNotIn("xfade=transition=fade:duration=0.001", graph)
+        self.assertIn("settb=AVTB,setpts=PTS-STARTPTS", graph)
+        self.assertEqual(command[command.index("-t") + 1], "8.600")
 
 
 if __name__ == "__main__":

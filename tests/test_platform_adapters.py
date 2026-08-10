@@ -8,7 +8,7 @@ import browser_auth_service
 import commercial_api
 import db
 import ai_publish_service
-from oauth_service import authorization_status, start_authorization
+from oauth_service import authorization_status, provider_preflight, start_authorization
 from oauth_token_store import protect, unprotect
 from platforms import adapter_catalog, get_adapter
 from platforms.base import PublishNotImplementedError
@@ -53,23 +53,21 @@ class PlatformAdapterTests(unittest.TestCase):
     def test_api_account_does_not_create_browser_profile(self):
         platform = commercial_api.row("SELECT * FROM platforms WHERE code='youtube'")
         account_id = commercial_api.save_publishing_account({
-            "platform_id": platform["id"], "account_name": "YouTube Brand", "oauth_client_id": "public-client-id",
-            "oauth_client_secret": "desktop-client-secret",
+            "platform_id": platform["id"], "account_name": "YouTube Brand",
         })
         account = commercial_api.row("SELECT * FROM publish_accounts WHERE id=?", (account_id,))
         self.assertEqual(account["publishing_mode"], "api")
         self.assertEqual(account["browser_profile_path"], "")
         self.assertEqual(authorization_status(account_id)["status"], "not_authorized")
-        api_config = __import__("json").loads(account["api_config_json"])
-        self.assertNotIn("desktop-client-secret", account["api_config_json"])
-        self.assertEqual(unprotect(api_config["client_secret_encrypted"]), "desktop-client-secret")
+        self.assertEqual(__import__("json").loads(account["api_config_json"]), {})
+        self.assertFalse(provider_preflight("youtube")["developer_configured"])
 
     def test_oauth_start_requires_client_id(self):
         platform = commercial_api.row("SELECT * FROM platforms WHERE code='x'")
         account_id = commercial_api.save_publishing_account({"platform_id": platform["id"], "account_name": "X Brand"})
         account = commercial_api.row("SELECT * FROM publish_accounts WHERE id=?", (account_id,))
         result = start_authorization(platform, account)
-        self.assertEqual(result["status"], "configure_required")
+        self.assertEqual(result["status"], "not_configured")
 
     def test_browser_cookie_detection_and_status_writeback(self):
         self.assertTrue(browser_auth_service._is_authenticated(
@@ -193,6 +191,11 @@ class PlatformAdapterTests(unittest.TestCase):
         self.assertIn("洗护OEM", prompt)
         self.assertIn("做品牌为什么要找源头工厂", prompt)
         self.assertIn("抖音", prompt)
+        runtime_config = completion.call_args.args[0]
+        self.assertEqual(runtime_config["provider"], "openai_compatible")
+        self.assertEqual(runtime_config["base_url"], "https://example.invalid/v1")
+        self.assertEqual(runtime_config["api_key"], "key")
+        self.assertEqual(runtime_config["model"], "model")
 
     @unittest.skipUnless(__import__("os").name == "nt", "DPAPI is Windows-only")
     def test_tokens_round_trip_through_windows_dpapi(self):

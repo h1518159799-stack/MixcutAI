@@ -14,7 +14,7 @@ APP_DIR = APP_HOME
 THUMB_DIR = DATA_DIR / "thumbnails"
 VOICE_DIR = DATA_DIR / "voices"
 DB_PATH = DATA_DIR / "mixcut.db"
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 24
 
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -119,7 +119,30 @@ def connect():
     conn = sqlite3.connect(DB_PATH, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 10000")
     return conn
+
+
+def generation_queue_seq_supported(conn: sqlite3.Connection) -> bool:
+    return "queue_seq" in {
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(generation_tasks)")
+    }
+
+
+def reserve_generation_queue_seqs(conn: sqlite3.Connection, count: int = 1) -> list[int]:
+    """Reserve durable FIFO sequence numbers inside the caller's write transaction.
+
+    Callers creating tasks use ``BEGIN IMMEDIATE`` before this helper.  SQLite's
+    database write lock then makes MAX(queue_seq)+1 allocation atomic across the
+    single-task and batch-task creation paths.
+    """
+    count = max(1, int(count))
+    if not generation_queue_seq_supported(conn):
+        return [0 for _ in range(count)]
+    current = int(conn.execute(
+        "SELECT COALESCE(MAX(queue_seq),0) FROM generation_tasks"
+    ).fetchone()[0] or 0)
+    return list(range(current + 1, current + count + 1))
 
 
 def _init_db_impl():
@@ -136,6 +159,9 @@ def _init_db_impl():
     except (OSError, ValueError):
         default_config = {}
     with connect() as conn:
+        previous_schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS account_profiles (
@@ -167,8 +193,12 @@ def _init_db_impl():
                 height INTEGER DEFAULT 0,
                 fps REAL DEFAULT 0,
                 size INTEGER DEFAULT 0,
+                file_mtime_ns INTEGER DEFAULT 0,
+                codec TEXT DEFAULT '',
                 thumbnail_path TEXT DEFAULT '',
                 status TEXT DEFAULT 'active',
+                scan_error TEXT DEFAULT '',
+                last_scanned_at TEXT DEFAULT '',
                 remark TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -181,11 +211,65 @@ def _init_db_impl():
                 total_files INTEGER DEFAULT 0,
                 scanned_files INTEGER DEFAULT 0,
                 added_count INTEGER DEFAULT 0,
+                updated_count INTEGER DEFAULT 0,
+                missing_count INTEGER DEFAULT 0,
+                error_count INTEGER DEFAULT 0,
+                unchanged_count INTEGER DEFAULT 0,
                 skipped_count INTEGER DEFAULT 0,
                 error_message TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 finished_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS smart_split_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_path TEXT NOT NULL,
+                source_hash TEXT NOT NULL DEFAULT '',
+                source_size INTEGER NOT NULL DEFAULT 0,
+                source_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                source_duration REAL NOT NULL DEFAULT 0,
+                source_width INTEGER NOT NULL DEFAULT 0,
+                source_height INTEGER NOT NULL DEFAULT 0,
+                source_fps REAL NOT NULL DEFAULT 0,
+                has_audio INTEGER NOT NULL DEFAULT 0,
+                sensitivity TEXT NOT NULL DEFAULT 'standard',
+                threshold REAL NOT NULL DEFAULT 0.30,
+                min_segment_duration REAL NOT NULL DEFAULT 1.0,
+                min_cut_gap REAL NOT NULL DEFAULT 0.65,
+                status TEXT NOT NULL DEFAULT 'pending',
+                stage TEXT NOT NULL DEFAULT '',
+                progress INTEGER NOT NULL DEFAULT 0,
+                output_dir TEXT NOT NULL DEFAULT '',
+                exported_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_smart_split_jobs_source
+                ON smart_split_jobs(source_hash,source_size,source_mtime_ns,status,id);
+            CREATE TABLE IF NOT EXISTS smart_split_segments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL DEFAULT 0,
+                start_time REAL NOT NULL DEFAULT 0,
+                end_time REAL NOT NULL DEFAULT 0,
+                duration REAL NOT NULL DEFAULT 0,
+                scene_score REAL NOT NULL DEFAULT 0,
+                selected INTEGER NOT NULL DEFAULT 1,
+                category TEXT NOT NULL DEFAULT '',
+                thumbnail_path TEXT NOT NULL DEFAULT '',
+                output_path TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'detected',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES smart_split_jobs(id) ON DELETE CASCADE,
+                UNIQUE(job_id,segment_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_smart_split_segments_job
+                ON smart_split_segments(job_id,segment_index);
             CREATE TABLE IF NOT EXISTS edit_templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -224,7 +308,8 @@ def _init_db_impl():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 template_id INTEGER,
                 task_name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'queued',
+                queue_seq INTEGER NOT NULL DEFAULT 0,
                 progress INTEGER DEFAULT 0,
                 current_shot TEXT DEFAULT '',
                 total_shots INTEGER DEFAULT 0,
@@ -255,9 +340,10 @@ def _init_db_impl():
                 total_count INTEGER NOT NULL DEFAULT 0,
                 completed_count INTEGER NOT NULL DEFAULT 0,
                 failed_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'queued',
                 material_strategy TEXT NOT NULL DEFAULT 'random',
                 category_ids_json TEXT NOT NULL DEFAULT '[]',
+                continue_on_child_error INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 finished_at TEXT DEFAULT '',
@@ -268,7 +354,7 @@ def _init_db_impl():
                 batch_id INTEGER NOT NULL,
                 task_id INTEGER NOT NULL,
                 index_no INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
+                status TEXT NOT NULL DEFAULT 'queued',
                 output_path TEXT DEFAULT '',
                 error_message TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -416,6 +502,15 @@ def _init_db_impl():
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(account_id) REFERENCES publish_accounts(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS oauth_provider_configs (
+                provider TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL DEFAULT '',
+                client_secret_encrypted TEXT NOT NULL DEFAULT '',
+                extra_config_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'not_configured',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS publish_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 generation_task_id INTEGER,
@@ -469,6 +564,99 @@ def _init_db_impl():
             );
             CREATE INDEX IF NOT EXISTS idx_publish_tasks_status ON publish_tasks(status,scheduled_at,id);
             CREATE INDEX IF NOT EXISTS idx_publish_channels_task ON publish_channels(publish_task_id,status,id);
+            CREATE TABLE IF NOT EXISTS publish_draft_metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                generation_task_id INTEGER NOT NULL UNIQUE,
+                title TEXT NOT NULL DEFAULT '',
+                hashtags TEXT NOT NULL DEFAULT '',
+                cover_text TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                ai_status TEXT NOT NULL DEFAULT 'not_started',
+                title_state TEXT NOT NULL DEFAULT 'not_started',
+                hashtags_state TEXT NOT NULL DEFAULT 'not_started',
+                cover_text_state TEXT NOT NULL DEFAULT 'not_started',
+                auto_generation_attempted INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                technical_log_id TEXT NOT NULL DEFAULT '',
+                ai_generated_at TEXT NOT NULL DEFAULT '',
+                source_batch_id INTEGER,
+                project_id INTEGER,
+                video_path TEXT NOT NULL DEFAULT '',
+                video_filename TEXT NOT NULL DEFAULT '',
+                video_duration REAL NOT NULL DEFAULT 0,
+                publish_status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(generation_task_id) REFERENCES generation_tasks(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_draft_metadata_status
+                ON publish_draft_metadata(ai_status,generation_task_id);
+            CREATE TABLE IF NOT EXISTS publish_account_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_used_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(name)
+            );
+            CREATE TABLE IF NOT EXISTS publish_account_group_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(group_id) REFERENCES publish_account_groups(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES publish_accounts(id) ON DELETE CASCADE,
+                UNIQUE(group_id,account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_group_members_group ON publish_account_group_members(group_id,enabled,sort_order,id);
+            CREATE INDEX IF NOT EXISTS idx_publish_group_members_account ON publish_account_group_members(account_id);
+            CREATE TABLE IF NOT EXISTS publish_group_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                group_id INTEGER NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                queued_count INTEGER NOT NULL DEFAULT 0,
+                running_count INTEGER NOT NULL DEFAULT 0,
+                succeeded_count INTEGER NOT NULL DEFAULT 0,
+                success_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                needs_action_count INTEGER NOT NULL DEFAULT 0,
+                idempotency_key TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                finished_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(group_id) REFERENCES publish_account_groups(id) ON DELETE RESTRICT
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_group_batches_status ON publish_group_batches(status,created_at,id);
+            CREATE TABLE IF NOT EXISTS publish_group_batch_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                task_id INTEGER,
+                account_id INTEGER,
+                group_id INTEGER,
+                group_batch_id INTEGER,
+                account_name_snapshot TEXT NOT NULL DEFAULT '',
+                platform_name_snapshot TEXT NOT NULL DEFAULT '',
+                platform_code_snapshot TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                blocked_reason TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(batch_id) REFERENCES publish_group_batches(id) ON DELETE CASCADE,
+                FOREIGN KEY(task_id) REFERENCES publish_tasks(id) ON DELETE SET NULL,
+                FOREIGN KEY(account_id) REFERENCES publish_accounts(id) ON DELETE SET NULL,
+                UNIQUE(batch_id,account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_publish_group_batch_items_batch ON publish_group_batch_items(batch_id,status,id);
             CREATE TABLE IF NOT EXISTS platform_test_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 platform_id INTEGER NOT NULL,
@@ -511,6 +699,14 @@ def _init_db_impl():
             """
         )
         ensure_column(conn, "template_shots", "enable_subtitle", "INTEGER DEFAULT 1")
+        ensure_column(conn, "materials", "file_mtime_ns", "INTEGER DEFAULT 0")
+        ensure_column(conn, "materials", "codec", "TEXT DEFAULT ''")
+        ensure_column(conn, "materials", "scan_error", "TEXT DEFAULT ''")
+        ensure_column(conn, "materials", "last_scanned_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "scan_tasks", "updated_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "scan_tasks", "missing_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "scan_tasks", "error_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "scan_tasks", "unchanged_count", "INTEGER DEFAULT 0")
         ensure_column(conn, "template_shots", "enable_tts", "INTEGER DEFAULT 1")
         ensure_column(conn, "template_shots", "estimated_duration", "REAL DEFAULT 3")
         ensure_column(conn, "template_shots", "voice_file_path", "TEXT DEFAULT ''")
@@ -524,6 +720,30 @@ def _init_db_impl():
         ensure_column(conn, "generation_tasks", "template_id", "INTEGER")
         ensure_column(conn, "generation_tasks", "current_shot", "TEXT DEFAULT ''")
         ensure_column(conn, "generation_tasks", "total_shots", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "started_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "last_heartbeat_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "current_stage", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "current_step", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "current_item", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "current_progress", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "worker_id", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "process_id", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "last_log_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "cancel_requested", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "retry_count", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "diagnostic_log", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "error_code", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "failed_stage", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "technical_log_id", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "log_path", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "finished_at", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "retry_of_task_id", "INTEGER")
+        ensure_column(conn, "generation_tasks", "process_name", "TEXT DEFAULT ''")
+        ensure_column(conn, "generation_tasks", "ffmpeg_pid", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "ffprobe_pid", "INTEGER DEFAULT 0")
+        ensure_column(conn, "generation_tasks", "attempt_no", "INTEGER NOT NULL DEFAULT 1")
+        ensure_column(conn, "generation_tasks", "queue_seq", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "batch_tasks", "continue_on_child_error", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "generation_shot_materials", "task_id", "INTEGER")
         ensure_column(conn, "platforms", "integration_type", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "platforms", "adapter_code", "TEXT NOT NULL DEFAULT ''")
@@ -533,6 +753,14 @@ def _init_db_impl():
         ensure_column(conn, "publish_accounts", "authorization_status", "TEXT NOT NULL DEFAULT 'not_authorized'")
         ensure_column(conn, "publish_accounts", "channel_id", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_accounts", "channel_title", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "provider", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "status", "TEXT NOT NULL DEFAULT 'waiting_callback'")
+        ensure_column(conn, "oauth_sessions", "authorization_url", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "result_encrypted", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "error_code", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "error_message", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "completed_at", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "oauth_sessions", "consumed_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "delete_after_publish", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "publish_tasks", "ai_title", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "ai_description", "TEXT NOT NULL DEFAULT ''")
@@ -541,18 +769,109 @@ def _init_db_impl():
         ensure_column(conn, "publish_tasks", "ai_generated_time", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "error_code", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "technical_log_id", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_tasks", "group_id", "INTEGER")
+        ensure_column(conn, "publish_tasks", "group_batch_id", "INTEGER")
+        ensure_column(conn, "publish_group_batches", "queued_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_group_batches", "running_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_group_batches", "succeeded_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_group_batches", "skipped_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_group_batches", "needs_action_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_group_batches", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "group_id", "INTEGER")
+        ensure_column(conn, "publish_group_batch_items", "group_batch_id", "INTEGER")
+        ensure_column(conn, "publish_group_batch_items", "account_name_snapshot", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "platform_name_snapshot", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "platform_code_snapshot", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "blocked_reason", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "error_code", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_group_batch_items", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_draft_metadata", "source_batch_id", "INTEGER")
+        ensure_column(conn, "publish_draft_metadata", "project_id", "INTEGER")
+        ensure_column(conn, "publish_draft_metadata", "video_path", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_draft_metadata", "video_filename", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_draft_metadata", "video_duration", "REAL NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_draft_metadata", "publish_status", "TEXT NOT NULL DEFAULT 'pending'")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_publish_draft_pending "
+            "ON publish_draft_metadata(publish_status,ai_status,generation_task_id)"
+        )
+        migrate_publish_group_batch_items_v15(conn)
         ensure_column(conn, "publish_channels", "error_code", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "technical_log_id", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "idempotency_key", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "video_file_hash", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "title_hash", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "result_evidence_json", "TEXT NOT NULL DEFAULT '{}'")
+        if previous_schema_version < 20:
+            # A fresh process cannot own a worker from the previous executable.
+            # Preserve interrupted work as stalled instead of pretending it is
+            # still running or silently submitting it again.
+            conn.execute(
+                """UPDATE generation_tasks SET status=CASE
+                     WHEN status='pending' THEN 'queued'
+                     WHEN status='completed' THEN 'succeeded'
+                     WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 'stalled'
+                     ELSE status END,
+                   current_stage=CASE WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 'stalled' ELSE current_stage END,
+                   current_step=CASE WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN '软件升级后检测到旧 Worker 已退出' ELSE current_step END,
+                   error_message=CASE WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging')
+                      THEN '软件上次退出时任务仍在执行，旧 Worker 已不存在，请诊断后重试' ELSE error_message END,
+                   worker_id='',process_id=0,process_name='',ffmpeg_pid=0,ffprobe_pid=0"""
+            )
+            conn.execute("UPDATE batch_task_items SET status='queued' WHERE status='pending'")
+            conn.execute("UPDATE batch_task_items SET status='succeeded' WHERE status='completed'")
+            conn.execute(
+                """UPDATE batch_task_items SET status='stalled',
+                   error_message=COALESCE(NULLIF((SELECT error_message FROM generation_tasks g WHERE g.id=batch_task_items.task_id),''),error_message)
+                   WHERE task_id IN (SELECT id FROM generation_tasks WHERE status='stalled')"""
+            )
+            for batch in conn.execute("SELECT id,total_count FROM batch_tasks ORDER BY id").fetchall():
+                item_rows = conn.execute(
+                    "SELECT status FROM batch_task_items WHERE batch_id=?", (int(batch["id"]),)
+                ).fetchall()
+                statuses = [str(item["status"] or "queued") for item in item_rows]
+                succeeded = statuses.count("succeeded")
+                failed = statuses.count("failed")
+                stalled = statuses.count("stalled")
+                queued = statuses.count("queued")
+                if statuses and succeeded == len(statuses):
+                    batch_status = "succeeded"
+                elif stalled:
+                    batch_status = "needs_action"
+                elif queued:
+                    batch_status = "queued"
+                elif succeeded and failed:
+                    batch_status = "partially_succeeded"
+                elif failed and failed == len(statuses):
+                    batch_status = "failed"
+                else:
+                    batch_status = "queued"
+                conn.execute(
+                    "UPDATE batch_tasks SET status=?,completed_count=?,failed_count=?,finished_at=CASE WHEN ? IN ('succeeded','partially_succeeded','failed') THEN finished_at ELSE '' END WHERE id=?",
+                    (batch_status, succeeded, failed, batch_status, int(batch["id"])),
+                )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_generation_shot_materials_task_shot "
             "ON generation_shot_materials(task_id, shot_id)"
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_task_items_batch ON batch_task_items(batch_id,index_no)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_batch_task_items_task ON batch_task_items(task_id)")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_single_active_generation_slot "
+            "ON generation_tasks((1)) WHERE status IN ('preparing','rendering','verifying')"
+        )
+        # Existing task ids already represent their durable creation order.
+        # Backfill once so upgrades keep the exact historic FIFO order, then
+        # use queue_seq for every new single or batch generation task.
+        conn.execute("UPDATE generation_tasks SET queue_seq=id WHERE COALESCE(queue_seq,0)<=0")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_generation_tasks_queue_seq "
+            "ON generation_tasks(queue_seq) WHERE queue_seq>0"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_generation_tasks_queue_status "
+            "ON generation_tasks(status,queue_seq,created_at,id)"
+        )
         # Upgrade legacy databases where material matches belonged only to the
         # reusable template shot.  Preserve the latest completed task's actual
         # selection so the first task created after this migration can avoid it.
@@ -568,7 +887,7 @@ def _init_db_impl():
             JOIN template_shots s ON s.id=gsm.shot_id
             JOIN generation_tasks t ON t.id=(
                 SELECT MAX(t2.id) FROM generation_tasks t2
-                WHERE t2.template_id=s.template_id AND t2.status='completed'
+                WHERE t2.template_id=s.template_id AND t2.status IN ('completed','succeeded')
             )
             WHERE gsm.task_id IS NULL
               AND gsm.id=(
@@ -657,11 +976,19 @@ def _init_db_impl():
                 "INSERT OR IGNORE INTO app_settings(key, value, updated_at) VALUES(?,?,?)",
                 (key, value, now()),
             )
-        # Two independent title/subtitle style presets. Existing users keep
-        # their current style as the domestic preset; international starts
-        # with smaller Latin-friendly typography.
+        # Only tasks completed after this feature is first installed may start
+        # automatic publishing-metadata generation. Existing historical videos
+        # remain untouched and can still be regenerated manually.
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings(key,value,updated_at) VALUES(?,?,?)",
+            ("publish_metadata_autogen_cutoff", now(), now()),
+        )
+        # Two independent title/subtitle presets.  The old implementation did
+        # not include title_main/title_sub in the scoped keys, so saving the
+        # overseas preset could still overwrite the domestic title text.  Keep
+        # every field used by the dialog in the scoped object.
         style_keys = (
-            "title_font_dir", "title_font", "title_font_size", "title_color",
+            "title_main", "title_sub", "title_font_dir", "title_font", "title_font_size", "title_color",
             "title_auto_fit", "title_background_enabled", "title_background_color",
             "title_background_opacity", "title_background_padding_y", "title_center",
             "title_outline_width", "title_outline_color", "title_shadow_color",
@@ -678,18 +1005,29 @@ def _init_db_impl():
                     "INSERT OR IGNORE INTO app_settings(key,value,updated_at) VALUES(?,?,?)",
                     ("domestic_" + key, current["value"], now()),
                 )
-        international_defaults = {
+        overseas_defaults = {
             "title_font": "Arial", "title_font_size": "92", "title_auto_fit": "1",
             "subtitle_font": "Arial", "subtitle_font_size": "58",
             "subtitle_max_chars_per_line": "24", "subtitle_outline_width": "2",
         }
         for key in style_keys:
             current = conn.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
-            value = international_defaults.get(key, current["value"] if current else "")
+            legacy = conn.execute(
+                "SELECT value FROM app_settings WHERE key=?", ("international_" + key,)
+            ).fetchone()
+            value = overseas_defaults.get(
+                key, legacy["value"] if legacy else (current["value"] if current else "")
+            )
             conn.execute(
                 "INSERT OR IGNORE INTO app_settings(key,value,updated_at) VALUES(?,?,?)",
-                ("international_" + key, value, now()),
+                ("overseas_" + key, value, now()),
             )
+        # Marker makes the legacy-global -> domestic migration explicit and
+        # prevents later starts from treating global values as fresh defaults.
+        conn.execute(
+            "INSERT OR IGNORE INTO app_settings(key,value,updated_at) VALUES(?,?,?)",
+            ("title_template_scope_migration_v2", "1", now()),
+        )
         if not conn.execute("SELECT 1 FROM tts_service_configs LIMIT 1").fetchone():
             conn.execute(
                 "INSERT INTO tts_service_configs(name,provider,model,response_format,is_enabled,is_default,created_at,updated_at) VALUES(?,?,?,?,1,1,?,?)",
@@ -909,3 +1247,54 @@ def ensure_column(conn, table, column, ddl):
     cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
+def migrate_publish_group_batch_items_v15(conn) -> None:
+    """Allow blocked rows without tasks and retain readable account snapshots."""
+    columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(publish_group_batch_items)")}
+    if not columns or "task_id" not in columns or not int(columns["task_id"]["notnull"]):
+        return
+    conn.execute("DROP TABLE IF EXISTS publish_group_batch_items_v15")
+    conn.execute(
+        """CREATE TABLE publish_group_batch_items_v15 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            task_id INTEGER,
+            account_id INTEGER,
+            group_id INTEGER,
+            group_batch_id INTEGER,
+            account_name_snapshot TEXT NOT NULL DEFAULT '',
+            platform_name_snapshot TEXT NOT NULL DEFAULT '',
+            platform_code_snapshot TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            blocked_reason TEXT NOT NULL DEFAULT '',
+            error_code TEXT NOT NULL DEFAULT '',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(batch_id) REFERENCES publish_group_batches(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES publish_tasks(id) ON DELETE SET NULL,
+            FOREIGN KEY(account_id) REFERENCES publish_accounts(id) ON DELETE SET NULL,
+            UNIQUE(batch_id,account_id)
+        )"""
+    )
+    conn.execute(
+        """INSERT OR IGNORE INTO publish_group_batch_items_v15(
+               id,batch_id,task_id,account_id,group_id,group_batch_id,
+               account_name_snapshot,platform_name_snapshot,platform_code_snapshot,
+               status,blocked_reason,error_code,retry_count,created_at,updated_at)
+           SELECT i.id,i.batch_id,i.task_id,i.account_id,
+                  COALESCE(i.group_id,b.group_id),COALESCE(i.group_batch_id,i.batch_id),
+                  COALESCE(NULLIF(i.account_name_snapshot,''),a.account_name,''),
+                  COALESCE(NULLIF(i.platform_name_snapshot,''),p.name,''),
+                  COALESCE(NULLIF(i.platform_code_snapshot,''),p.code,''),
+                  i.status,COALESCE(i.blocked_reason,''),COALESCE(i.error_code,''),
+                  COALESCE(i.retry_count,0),i.created_at,i.updated_at
+           FROM publish_group_batch_items i
+           LEFT JOIN publish_group_batches b ON b.id=i.batch_id
+           LEFT JOIN publish_accounts a ON a.id=i.account_id
+           LEFT JOIN platforms p ON p.id=a.platform_id"""
+    )
+    conn.execute("DROP TABLE publish_group_batch_items")
+    conn.execute("ALTER TABLE publish_group_batch_items_v15 RENAME TO publish_group_batch_items")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_publish_group_batch_items_batch ON publish_group_batch_items(batch_id,status,id)")

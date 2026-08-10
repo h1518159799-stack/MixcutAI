@@ -280,9 +280,7 @@ def preflight_publish_check(
             stream.read(1)
     except OSError as exc:
         raise guarded_error("FILE_UNREADABLE") from exc
-    with connect() as conn:
-        ffprobe_row = conn.execute("SELECT value FROM app_settings WHERE key='ffprobe_path'").fetchone()
-    video_info = _probe_video(path, str(ffprobe_row["value"] if ffprobe_row else ""))
+    video_info = _probe_video(path)
     limits = LIMITS[code]
     title = str(metadata.get("title") or "").strip()
     if not title or len(title) > limits["title"]:

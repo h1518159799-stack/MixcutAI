@@ -1,4 +1,4 @@
-﻿"""Signed desktop license verification.
+"""Signed desktop license verification.
 
 Trust model:
 * the client contains only an Ed25519 public verification key;
@@ -31,7 +31,7 @@ from runtime_paths import CONFIG_DIR, DATA_DIR
 
 
 PRODUCT_ID = "mixcut-ai-windows"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.12"
 TOKEN_PREFIX = "MXLIC1"
 VALID_TYPES = {"month", "year", "permanent"}
 PUBLIC_KEY_B64 = "FS/YNzoWyelZRmfTJq7yZxFYnsjY8mlMha6XHofb4Qk="

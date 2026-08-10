@@ -1,13 +1,12 @@
 {
   "product_name": "MixcutAI",
   "product_id": "mixcut-ai-windows",
-  "app_version": "1.3.6",
-  "ffmpeg_path": "",
-  "ffprobe_path": "",
+  "app_version": "1.3.12",
   "output_dir": "",
   "work_dir": "",
   "license_server_url": "",
   "update_manifest_url": "",
   "auto_check_update": false,
-  "说明": "复制后填写本机路径。不要写入 API Key OAuth Token Cookie 或许可证私钥。"
+  "说明": "复制后填写本机路径。不要写入 API Key OAuth Token Cookie 或许可证私钥。",
+  "??": "?????????????????FFmpeg?FFprobe?????????????????? API Key OAuth Token Cookie ???????"
 }

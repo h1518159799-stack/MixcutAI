@@ -70,11 +70,11 @@ python -c "from db import init_db; init_db()"
 
 `db.py` 会执行现有迁移。不要从旧用户包直接覆盖新电脑数据库。
 
-## 6. 配置 FFmpeg
+## 6. 准备 FFmpeg（仅源码开发环境）
 
-启动软件后进入“系统设置”，选择新电脑上的 `ffmpeg.exe` 和 `ffprobe.exe`。路径因电脑而异，备份不保存旧电脑绝对路径。
+正式用户包会自动携带 `runtime/ffmpeg/bin/ffmpeg.exe` 和 `ffprobe.exe`，普通用户无需配置路径。
 
-FFmpeg 可从官方构建来源重新下载，不应提交到源码仓库。
+源码开发环境可将二进制放到 `vendor/ffmpeg/bin/`，或安装到系统 PATH。FFmpeg 二进制不提交到源码仓库；正式构建脚本会自动复制并验证两项组件，缺失时直接终止构建。
 
 ## 7. 启动软件
 

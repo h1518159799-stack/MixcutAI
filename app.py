@@ -16,6 +16,7 @@ from tts_service import TtsError, audio_duration, synthesize_windows_tts
 from video_engine import VideoGenerationError, generate_video, load_template_shots
 from timeline_engine import build_timeline_from_shots
 from video_scan import make_thumbnail, probe_video, quick_hash, scan_video_files
+from runtime_paths import get_ffmpeg_path, get_ffprobe_path, get_media_runtime_status
 
 APP_TITLE = "AI自动混剪软件 - Windows基础版"
 COLORS = {
@@ -245,8 +246,8 @@ class MixcutApp(tk.Tk):
             exec_sql("UPDATE scan_tasks SET total_files=? WHERE id=?", (total, task_id))
             cat = fetch_one("SELECT id FROM material_categories ORDER BY sort_order LIMIT 1")
             default_cat = cat["id"] if cat else None
-            ffmpeg = (fetch_one("SELECT value FROM app_settings WHERE key='ffmpeg_path'") or {}).get("value", "")
-            ffprobe = (fetch_one("SELECT value FROM app_settings WHERE key='ffprobe_path'") or {}).get("value", "")
+            ffmpeg = get_ffmpeg_path()
+            ffprobe = get_ffprobe_path()
             added = skipped = 0
             for idx, p in enumerate(files, 1):
                 if fetch_one("SELECT id FROM materials WHERE file_path=?", (str(p),)):
@@ -810,7 +811,7 @@ class MixcutApp(tk.Tk):
     def generation_worker(self, task_id, template_id):
         try:
             settings = {r["key"]: r["value"] for r in fetch_all("SELECT * FROM app_settings")}
-            path = generate_video(task_id, template_id, settings.get("ffmpeg_path", ""), settings.get("output_dir", ""))
+            path = generate_video(task_id, template_id, "", settings.get("output_dir", ""))
             self.generation_queue.put(("done", task_id, path))
         except Exception as e:
             exec_sql("UPDATE generation_tasks SET status=?,progress=?,error_message=?,current_shot=?,updated_at=? WHERE id=?", ("failed", 0, str(e), "失败", now(), task_id))
@@ -1381,28 +1382,27 @@ class MixcutApp(tk.Tk):
 
     # 设置
     def page_设置(self):
-        self.title_block("设置", "配置输出目录和 FFmpeg/FFprobe 路径。")
+        self.title_block("设置", "配置输出目录和媒体资源，视频处理组件已随软件内置。")
         box = self.card(self.body)
         box.pack(fill="both", expand=True, padx=28, pady=14)
         form = tk.Frame(box, bg=COLORS["panel"])
         form.pack(fill="x", padx=18, pady=18)
         data = {r["key"]: r["value"] for r in fetch_all("SELECT * FROM app_settings")}
         self.s_output = self.input(form, "默认输出目录", 0)
-        self.s_ffmpeg = self.input(form, "FFmpeg 路径", 1)
-        self.s_ffprobe = self.input(form, "FFprobe 路径", 2)
-        self.s_bgm_dir = self.input(form, "BGM目录", 3)
+        self.s_bgm_dir = self.input(form, "BGM目录", 1)
         self.s_output.insert(0, data.get("output_dir", ""))
-        self.s_ffmpeg.insert(0, data.get("ffmpeg_path", ""))
-        self.s_ffprobe.insert(0, data.get("ffprobe_path", ""))
         self.s_bgm_dir.insert(0, data.get("bgm_dir", ""))
+        status = get_media_runtime_status()
+        state = "正常" if status["ready"] else "异常"
+        detail = f"FFmpeg {status['ffmpeg'].get('version') or '未检测'} · FFprobe {status['ffprobe'].get('version') or '未检测'}"
+        tk.Label(form, text=f"视频处理引擎：{state}  {detail}\n视频处理组件已内置，无需配置。", bg=COLORS["panel"], fg=COLORS["muted"], justify="left").grid(row=4,column=0,sticky="w",pady=12)
         btns = tk.Frame(form, bg=COLORS["panel"])
-        btns.grid(row=8, column=0, sticky="w", pady=12)
+        btns.grid(row=5, column=0, sticky="w", pady=12)
         self.btn(btns, "选择BGM目录", self.choose_bgm_dir, COLORS["card"]).pack(side="left")
         self.btn(btns, "扫描BGM", self.scan_bgm_from_settings, COLORS["accent"]).pack(side="left", padx=8)
         self.btn(btns, "保存设置", self.save_settings, COLORS["green"]).pack(side="left")
         form.columnconfigure(0, weight=1)
-        tk.Label(box, text=f"数据库：{DB_PATH}\n未配置 FFmpeg 时软件仍可运行，但时长/分辨率可能显示未知，缩略图会使用占位图。", bg=COLORS["panel"], fg=COLORS["muted"], justify="left").pack(anchor="w", padx=18, pady=8)
-
+        tk.Label(box, text=f"数据库：{DB_PATH}", bg=COLORS["panel"], fg=COLORS["muted"], justify="left").pack(anchor="w", padx=18, pady=8)
         tk.Label(box, text="BGM库", bg=COLORS["panel"], fg=COLORS["text"], font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", padx=18, pady=(12, 4))
         self.bgm_tree = ttk.Treeview(box, columns=("id", "name", "duration", "volume", "path"), show="headings", height=8)
         for c, t, w in [("id", "ID", 50), ("name", "名称", 180), ("duration", "时长", 90), ("volume", "默认音量", 90), ("path", "路径", 520)]:
@@ -1415,7 +1415,7 @@ class MixcutApp(tk.Tk):
         self.refresh_bgm_tree()
 
     def save_settings(self):
-        for k, v in {"output_dir": self.s_output.get().strip(), "ffmpeg_path": self.s_ffmpeg.get().strip(), "ffprobe_path": self.s_ffprobe.get().strip(), "bgm_dir": self.s_bgm_dir.get().strip()}.items():
+        for k, v in {"output_dir": self.s_output.get().strip(), "bgm_dir": self.s_bgm_dir.get().strip()}.items():
             exec_sql("INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (k, v, now()))
         messagebox.showinfo("完成", "设置已保存")
 
@@ -1431,7 +1431,7 @@ class MixcutApp(tk.Tk):
             messagebox.showinfo("提示", "先选择BGM目录")
             return
         self.save_settings()
-        result = scan_bgm_folder(folder, self.s_ffprobe.get().strip())
+        result = scan_bgm_folder(folder)
         self.refresh_bgm_tree()
         messagebox.showinfo("扫描完成", f"共 {result['total']} 个音频，新增 {result['added']}，更新 {result['updated']}")
 

@@ -6,7 +6,6 @@ import contextlib
 import ctypes
 import json
 import os
-import shutil
 import socket
 import subprocess
 import threading
@@ -16,7 +15,7 @@ from commercial_api import CommercialHandler, prepare
 from activation_window import require_activation, show_expiry_reminder
 from db import connect
 from runtime_paths import (
-    APP_HOME, DATA_DIR, RESOURCE_DIR, BUNDLED_FFMPEG_EXE,
+    APP_HOME, DATA_DIR, RESOURCE_DIR, get_media_runtime_status,
     ensure_material_workspace, ensure_runtime_dirs,
 )
 from browser_profile_service import find_chromium
@@ -42,28 +41,21 @@ def enable_dpi_awareness() -> None:
             pass
 
 
-def warn_missing_ffmpeg() -> None:
-    with connect() as conn:
-        row = conn.execute("SELECT value FROM app_settings WHERE key='ffmpeg_path'").fetchone()
-    configured = str(row[0] if row else "").strip()
-    available = (
-        bool(configured and Path(configured).is_file())
-        or BUNDLED_FFMPEG_EXE.is_file()
-        or bool(shutil.which("ffmpeg"))
-    )
+def check_media_runtime() -> None:
+    status = get_media_runtime_status(refresh=True)
     (DATA_DIR / "preflight.json").write_text(
-        json.dumps({"ffmpeg_available": available, "configured_path": configured}, ensure_ascii=False),
+        json.dumps({"media_runtime": status}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    if available:
+    if status["ready"]:
         return
     import tkinter as tk
     from tkinter import messagebox
     root = tk.Tk(); root.withdraw()
     messagebox.showwarning(
-        "FFmpeg 尚未配置",
-        "当前没有检测到 FFmpeg。软件界面可以正常启动，但生成语音转码、字幕烧录和最终成片前，"
-        "请在“系统设置”中填写 ffmpeg.exe 和 ffprobe.exe 的完整路径。",
+        "视频处理组件异常",
+        "视频处理组件缺失或损坏，请重新安装Mixcut Studio。\n\n"
+        "可以进入“系统设置 → 视频处理引擎”重新检测并查看诊断状态。",
         parent=root,
     )
     root.destroy()
@@ -99,7 +91,7 @@ def main() -> int:
     except (TypeError, ValueError):
         reminder_days = 7
     show_expiry_reminder(reminder_days)
-    warn_missing_ffmpeg()
+    check_media_runtime()
     if not (DIST_DIR / "index.html").exists():
         raise SystemExit("商业 UI 尚未构建，请先在 ui-commercial 目录运行 npm.cmd run build")
 

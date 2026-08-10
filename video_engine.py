@@ -1,15 +1,16 @@
-import shutil
 import subprocess
 import random
 import json
 from pathlib import Path
 
-from runtime_paths import BUNDLED_FFMPEG_EXE
+from runtime_paths import MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
 
 from db import APP_DIR, connect, now
 from bgm_service import scan_bgm_folder
 from timeline_engine import TimelineError, build_color_filter, build_timeline_from_shots, render_timeline
 from tts_service import audio_duration
+from task_runtime import heartbeat, run_managed_command
+from generation_success_service import on_generation_succeeded
 
 SEGMENT_W = 1080
 SEGMENT_H = 1920
@@ -20,14 +21,10 @@ class VideoGenerationError(RuntimeError):
 
 
 def find_ffmpeg(configured: str = "") -> str:
-    if configured and Path(configured).exists():
-        return configured
-    if BUNDLED_FFMPEG_EXE.is_file():
-        return str(BUNDLED_FFMPEG_EXE)
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    raise VideoGenerationError("未找到 ffmpeg。请在【设置】里配置 ffmpeg.exe 路径。")
+    try:
+        return get_ffmpeg_path()
+    except MediaRuntimeError as exc:
+        raise VideoGenerationError(str(exc)) from exc
 
 
 def update_task(task_id, **fields):
@@ -103,10 +100,9 @@ def load_default_bgm():
     if not row:
         with connect() as conn:
             bgm_dir = conn.execute("SELECT value FROM app_settings WHERE key='bgm_dir'").fetchone()
-            ffprobe = conn.execute("SELECT value FROM app_settings WHERE key='ffprobe_path'").fetchone()
         folder = str(bgm_dir["value"] if bgm_dir else "").strip()
         if folder and Path(folder).is_dir():
-            scan_bgm_folder(folder, str(ffprobe["value"] if ffprobe else ""))
+            scan_bgm_folder(folder)
             with connect() as conn:
                 candidates = conn.execute("SELECT * FROM bgm_library ORDER BY id").fetchall()
                 candidates = [item for item in candidates if Path(item["file_path"]).is_file()]
@@ -178,14 +174,20 @@ def refresh_real_voice_durations(shots, ffprobe_path=""):
 
 
 def probe_av_durations(ffmpeg, path):
-    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe")) if Path(ffmpeg).name.lower() == "ffmpeg.exe" else "ffprobe"
-    proc = subprocess.run(
-        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration:format=duration", "-of", "json", str(path)],
-        capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=30,
-        **background_process_kwargs(),
-    )
-    if proc.returncode != 0:
-        raise VideoGenerationError("无法读取最终成片的音视频时长")
+    try:
+        ffprobe = get_ffprobe_path()
+    except MediaRuntimeError as exc:
+        raise VideoGenerationError(str(exc)) from exc
+    heartbeat(stage="ffprobe", step="验收成片音视频时长")
+    try:
+        proc = run_managed_command(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration:format=duration", "-of", "json", str(path)],
+            timeout=30, error_type=VideoGenerationError, failure_message="无法读取最终成片的音视频时长",
+        )
+    except VideoGenerationError:
+        raise
+    except Exception as exc:
+        raise VideoGenerationError(str(exc)) from exc
     payload = json.loads(proc.stdout or "{}")
     format_duration = float((payload.get("format") or {}).get("duration") or 0)
     durations = {"video": 0.0, "audio": 0.0}
@@ -281,9 +283,22 @@ def validate_shots(shots):
 
 
 def run_ffmpeg(cmd):
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", **background_process_kwargs())
-    if proc.returncode != 0:
-        raise VideoGenerationError((proc.stderr or proc.stdout or "ffmpeg 执行失败").strip()[-3000:])
+    heartbeat(stage="ffmpeg", step="FFmpeg 正在处理视频")
+    durations = []
+    for index, value in enumerate(cmd[:-1]):
+        if value in {"-t", "-to"}:
+            try:
+                durations.append(float(cmd[index + 1]))
+            except (TypeError, ValueError):
+                pass
+    timeout = min(3600, max(120, (max(durations) if durations else 60) * 12 + 90))
+    try:
+        run_managed_command(cmd, timeout=timeout, error_type=VideoGenerationError,
+                            failure_message="FFmpeg 执行失败")
+    except VideoGenerationError:
+        raise
+    except Exception as exc:
+        raise VideoGenerationError(str(exc)) from exc
 
 
 def ffmpeg_filter_path(path: str) -> str:
@@ -383,11 +398,14 @@ def concat_segments(ffmpeg, segments, output_path, work_dir):
 
 
 def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_root=""):
-    ffmpeg = find_ffmpeg(ffmpeg_path)
+    ffmpeg = find_ffmpeg()
     # A task owns an immutable material selection.  Never read the template's
     # old editor-preview match here, otherwise every task renders the same clips.
     shots = load_template_shots(template_id, task_id)
-    ffprobe_path = str(Path(ffmpeg).with_name("ffprobe.exe")) if Path(ffmpeg).name.lower() == "ffmpeg.exe" else ""
+    try:
+        ffprobe_path = get_ffprobe_path()
+    except MediaRuntimeError as exc:
+        raise VideoGenerationError(str(exc)) from exc
     shots = refresh_real_voice_durations(shots, ffprobe_path)
     validate_shots(shots)
 
@@ -400,7 +418,8 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
     final_path = out_root / f"task_{task_id}_final.mp4"
 
     total = len(shots)
-    update_task(task_id, status="running", progress=1, total_shots=total, current_shot="构建时间线")
+    update_task(task_id, status="preparing", progress=1, total_shots=total, current_shot="构建时间线")
+    heartbeat(task_id, status="rendering", stage="timeline", step="构建时间线", progress=42)
     color_filter_enabled, color_filter_strength = load_color_filter_config()
     end_hold_duration, inter_shot_safety = load_timeline_timing_config()
     timeline = build_timeline_from_shots(
@@ -418,7 +437,8 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
     for item in timeline.get("items", []):
         if item.get("type") == "audio":
             item["volume"] = voice_volume
-    update_task(task_id, status="processing_shot", current_shot="渲染时间线分镜", progress=10)
+    update_task(task_id, status="rendering", current_shot="渲染时间线分镜", progress=45)
+    heartbeat(task_id, status="rendering", stage="rendering", step="渲染时间线分镜", progress=45)
     try:
         render_timeline(ffmpeg, timeline, final_path, work_dir)
         timing = validate_final_timing(ffmpeg, final_path, timeline)
@@ -429,7 +449,31 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
         final_path.unlink(missing_ok=True)
         update_task(task_id, status="failed", current_shot="时长验收失败", error_message=str(exc))
         raise VideoGenerationError(str(exc)) from exc
-    update_task(task_id, status="merging", current_shot="合并时间线", progress=95)
-    update_task(task_id, status="completed", progress=100, current_shot="完成", output_path=str(final_path), error_message="")
+    heartbeat(task_id, status="verifying", stage="verifying", step="合并并验收成片", progress=95)
+    update_task(task_id, status="verifying", current_shot="合并时间线", progress=95)
+    try:
+        on_generation_succeeded(
+            task_id,
+            final_path,
+            verified_duration=float(timing.get("video_duration") or 0.0),
+            ffprobe_path=ffprobe_path,
+        )
+    except Exception as exc:
+        update_task(
+            task_id,
+            status="failed",
+            current_stage="publish_registration",
+            current_step="??????",
+            current_shot="??????",
+            error_code="PUBLISH_REGISTRATION_FAILED",
+            error_message=str(exc),
+            failed_stage="publish_registration",
+            finished_at=now(),
+        )
+        raise VideoGenerationError(str(exc)) from exc
+    heartbeat(
+        task_id, status="succeeded", stage="succeeded", step="??", progress=100,
+        log=f"?????{final_path}",
+    )
     return str(final_path)
 from subprocess_utils import background_process_kwargs

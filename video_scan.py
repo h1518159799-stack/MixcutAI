@@ -1,7 +1,6 @@
 
 import hashlib
 import json
-import shutil
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -9,18 +8,16 @@ from typing import Dict, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 
 from db import THUMB_DIR
-from runtime_paths import BUNDLED_FFMPEG_EXE, BUNDLED_FFPROBE_EXE
+from runtime_paths import MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
 
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".mpeg", ".mpg"}
 
 
 def find_executable(name: str, configured: str = "") -> Optional[str]:
-    if configured and Path(configured).exists():
-        return configured
-    bundled = BUNDLED_FFPROBE_EXE if name.lower().startswith("ffprobe") else BUNDLED_FFMPEG_EXE
-    if bundled.is_file():
-        return str(bundled)
-    return shutil.which(name)
+    try:
+        return get_ffprobe_path() if name.lower().startswith("ffprobe") else get_ffmpeg_path()
+    except MediaRuntimeError:
+        return None
 
 
 def scan_video_files(folder: str) -> List[Path]:
@@ -49,27 +46,37 @@ def probe_video(path: Path, ffprobe_path: str = "") -> Dict:
         "height": 0,
         "fps": 0.0,
         "size": path.stat().st_size if path.exists() else 0,
+        "codec": "",
+        "error": "",
     }
     ffprobe = find_executable("ffprobe", ffprobe_path)
     if not ffprobe:
+        result["error"] = "视频处理组件缺失或损坏，请重新安装Mixcut Studio"
         return result
     cmd = [
         ffprobe,
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate:format=duration,size",
+        "-show_entries", "stream=width,height,r_frame_rate,codec_name:format=duration,size",
         "-of", "json",
         str(path),
     ]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=15, encoding="utf-8", errors="ignore", **background_process_kwargs())
         if p.returncode != 0:
+            detail = (p.stderr or "").lower()
+            result["error"] = "文件正在被其他程序占用" if "permission denied" in detail else "素材无法读取或视频格式异常"
             return result
         data = json.loads(p.stdout or "{}")
-        stream = (data.get("streams") or [{}])[0]
+        streams = data.get("streams") or []
+        if not streams:
+            result["error"] = "未检测到有效视频轨道"
+            return result
+        stream = streams[0]
         fmt = data.get("format") or {}
         result["width"] = int(stream.get("width") or 0)
         result["height"] = int(stream.get("height") or 0)
+        result["codec"] = str(stream.get("codec_name") or "")
         result["duration"] = float(fmt.get("duration") or 0)
         result["size"] = int(fmt.get("size") or result["size"] or 0)
         rate = stream.get("r_frame_rate") or "0/1"
@@ -78,12 +85,18 @@ def probe_video(path: Path, ffprobe_path: str = "") -> Dict:
             result["fps"] = round(float(a) / float(b), 3) if float(b or 1) else 0.0
         else:
             result["fps"] = float(rate or 0)
-    except Exception:
-        pass
+        if result["duration"] <= 0 or result["width"] <= 0 or result["height"] <= 0:
+            result["error"] = "视频元数据不完整"
+    except subprocess.TimeoutExpired:
+        result["error"] = "FFprobe处理超时"
+    except PermissionError:
+        result["error"] = "文件正在被其他程序占用"
+    except (OSError, ValueError, json.JSONDecodeError):
+        result["error"] = "素材无法读取或视频格式异常"
     return result
 
 
-def make_thumbnail(path: Path, file_hash: str, ffmpeg_path: str = "") -> str:
+def make_thumbnail_with_status(path: Path, file_hash: str, ffmpeg_path: str = "") -> tuple[str, str]:
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     out = THUMB_DIR / f"{file_hash[:16]}.jpg"
     ffmpeg = find_executable("ffmpeg", ffmpeg_path)
@@ -95,10 +108,17 @@ def make_thumbnail(path: Path, file_hash: str, ffmpeg_path: str = "") -> str:
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=25, encoding="utf-8", errors="ignore", **background_process_kwargs())
             if p.returncode == 0 and out.exists():
-                return str(out)
+                return str(out), ""
+            return create_placeholder_thumbnail(path, out), "缩略图生成失败，已使用占位图"
+        except subprocess.TimeoutExpired:
+            return create_placeholder_thumbnail(path, out), "缩略图生成超时，已使用占位图"
         except Exception:
-            pass
-    return create_placeholder_thumbnail(path, out)
+            return create_placeholder_thumbnail(path, out), "缩略图生成失败，已使用占位图"
+    return create_placeholder_thumbnail(path, out), "视频处理组件缺失或损坏，已使用占位图"
+
+
+def make_thumbnail(path: Path, file_hash: str, ffmpeg_path: str = "") -> str:
+    return make_thumbnail_with_status(path, file_hash, ffmpeg_path)[0]
 
 
 def create_placeholder_thumbnail(path: Path, out: Path) -> str:

@@ -1,4 +1,4 @@
-﻿"""Secure online update client for Mixcut AI.
+"""Secure online update client for Mixcut AI.
 
 This module is isolated from video, TTS, timeline and licensing code. It only
 checks an HTTPS manifest, stages a verified EXE and starts MixcutUpdater.exe.
@@ -64,7 +64,7 @@ def current_version() -> str:
                 return str(value).strip()
         except (OSError, ValueError, TypeError):
             continue
-    return "1.3.6"
+    return "1.3.12"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:

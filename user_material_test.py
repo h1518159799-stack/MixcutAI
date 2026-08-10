@@ -16,11 +16,12 @@ from db import APP_DIR, VOICE_DIR, connect, init_db, now
 from subtitle_service import generate_ass_for_shot
 from video_engine import generate_video
 from video_scan import make_thumbnail, probe_video, quick_hash
+from runtime_paths import get_ffmpeg_path, get_ffprobe_path
 
 
 MATERIAL_ROOT = Path("D:/Video/混剪素材")
-FFMPEG = Path("D:/Video/videomix/resources/backend/_internal/static/ffmpeg/bin/ffmpeg.exe")
-FFPROBE = Path("D:/Video/videomix/resources/backend/_internal/static/ffmpeg/bin/ffprobe.exe")
+FFMPEG = Path(get_ffmpeg_path())
+FFPROBE = Path(get_ffprobe_path())
 TEST_ROOT = APP_DIR / "data" / "user_material_tests"
 DESKTOP = Path.home() / "Desktop"
 

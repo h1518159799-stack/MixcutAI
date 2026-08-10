@@ -4,6 +4,8 @@ import subprocess
 import random
 from pathlib import Path
 
+from runtime_paths import MediaRuntimeError, get_ffprobe_path
+
 SEGMENT_W = 1080
 SEGMENT_H = 1920
 FPS = 30
@@ -256,9 +258,22 @@ def save_timeline(timeline, path):
 
 
 def run_ffmpeg(cmd):
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", **background_process_kwargs())
-    if proc.returncode != 0:
-        raise TimelineError((proc.stderr or proc.stdout or "ffmpeg 执行失败").strip()[-4000:])
+    heartbeat(stage="ffmpeg", step="FFmpeg 正在渲染")
+    durations = []
+    for index, value in enumerate(cmd[:-1]):
+        if value in {"-t", "-to"}:
+            try:
+                durations.append(float(cmd[index + 1]))
+            except (TypeError, ValueError):
+                pass
+    timeout = min(3600, max(120, (max(durations) if durations else 60) * 12 + 90))
+    try:
+        run_managed_command(cmd, timeout=timeout, error_type=TimelineError,
+                            failure_message="FFmpeg 渲染失败")
+    except TimelineError:
+        raise
+    except Exception as exc:
+        raise TimelineError(str(exc)) from exc
 
 
 def ffmpeg_filter_path(path):
@@ -623,21 +638,50 @@ def concat_segments_with_transitions(ffmpeg, segments, transitions, output_path,
     for segment in segments:
         cmd += ["-i", str(segment)]
         durations.append(probe_duration(ffmpeg, segment))
+    # Every input must start at zero and use the same video time base before it
+    # enters concat/xfade.  More importantly, a disabled transition is a hard
+    # cut, not a 1 ms xfade.  FFmpeg can emit only the longest input's video
+    # frames when xfade is asked to operate below one frame (the old 0.001 s
+    # workaround), while the concatenated audio remains full length.
     chains = []
-    video_label, audio_label = "0:v", "0:a"
+    for index in range(len(segments)):
+        chains.append(f"[{index}:v]settb=AVTB,setpts=PTS-STARTPTS[vin{index}]")
+        chains.append(
+            f"[{index}:a]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[ain{index}]"
+        )
+    video_label, audio_label = "vin0", "ain0"
     elapsed = durations[0]
     for index in range(1, len(segments)):
         transition = transitions[index - 1] if index - 1 < len(transitions) else {"effect": "fade", "duration": 0.001, "enabled": False}
-        if not transition.get("enabled"):
-            transition = {"effect": "fade", "duration": 0.001, "enabled": False}
-        td = max(0.001, min(float(transition.get("duration") or 0.35), durations[index - 1] * 0.45, durations[index] * 0.45))
-        offset = max(0.0, elapsed - td)
         vout, aout = f"v{index}", f"a{index}"
-        effect = TRANSITION_FILTERS.get(str(transition.get("effect")), "fade")
-        chains.append(f"[{video_label}][{index}:v]xfade=transition={effect}:duration={td:.3f}:offset={offset:.3f}[{vout}]")
-        chains.append(f"[{audio_label}][{index}:a]acrossfade=d={td:.3f}:c1=tri:c2=tri[{aout}]")
+        if transition.get("enabled"):
+            td = max(
+                1.0 / FPS,
+                min(
+                    float(transition.get("duration") or 0.35),
+                    durations[index - 1] * 0.45,
+                    durations[index] * 0.45,
+                ),
+            )
+            offset = max(0.0, elapsed - td)
+            effect = TRANSITION_FILTERS.get(str(transition.get("effect")), "fade")
+            chains.append(
+                f"[{video_label}][vin{index}]xfade=transition={effect}:"
+                f"duration={td:.3f}:offset={offset:.3f}[{vout}]"
+            )
+            chains.append(
+                f"[{audio_label}][ain{index}]acrossfade=d={td:.3f}:c1=tri:c2=tri[{aout}]"
+            )
+            elapsed += durations[index] - td
+        else:
+            chains.append(
+                f"[{video_label}][vin{index}]concat=n=2:v=1:a=0[{vout}]"
+            )
+            chains.append(
+                f"[{audio_label}][ain{index}]concat=n=2:v=0:a=1[{aout}]"
+            )
+            elapsed += durations[index]
         video_label, audio_label = vout, aout
-        elapsed += durations[index] - td
     final_duration = max(0.001, elapsed)
     chains.append(f"[{video_label}]trim=duration={final_duration:.3f},setpts=PTS-STARTPTS[vfinal]")
     chains.append(
@@ -652,11 +696,20 @@ def concat_segments_with_transitions(ffmpeg, segments, transitions, output_path,
 
 
 def probe_duration(ffmpeg, path):
-    ffprobe = str(Path(ffmpeg).with_name("ffprobe.exe")) if Path(ffmpeg).name.lower() == "ffmpeg.exe" else "ffprobe"
-    proc = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "default=nw=1:nk=1", str(path)],
-                          capture_output=True, text=True, **background_process_kwargs())
-    if proc.returncode != 0:
-        raise TimelineError("无法读取转场分镜时长")
+    try:
+        ffprobe = get_ffprobe_path()
+    except MediaRuntimeError as exc:
+        raise TimelineError(str(exc)) from exc
+    heartbeat(stage="ffprobe", step="读取分镜时长")
+    try:
+        proc = run_managed_command(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "default=nw=1:nk=1", str(path)],
+            timeout=30, error_type=TimelineError, failure_message="无法读取转场分镜时长",
+        )
+    except TimelineError:
+        raise
+    except Exception as exc:
+        raise TimelineError(str(exc)) from exc
     return float(proc.stdout.strip())
 
 
@@ -690,3 +743,4 @@ def mix_sfx(ffmpeg, video_path, sfx_items, output_path):
             "-t", f"{target_duration:.3f}", "-movflags", "+faststart", str(output_path)]
     run_ffmpeg(cmd)
 from subprocess_utils import background_process_kwargs
+from task_runtime import heartbeat, run_managed_command

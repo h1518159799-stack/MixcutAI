@@ -2,17 +2,19 @@ import io
 import json
 import sys
 import threading
+import types
 import unittest
 import wave
 from array import array
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from ai_services import chat_completion, concatenate_tts_wavs, synthesize_tts
+from ai_services import _synthesize_edge_tts, chat_completion, concatenate_tts_wavs, synthesize_tts
 
 
 def wav_bytes(seconds=0.25, rate=24000):
@@ -101,6 +103,24 @@ class ServiceAdapterTests(unittest.TestCase):
             )
         self.assertLess(duration, 0.6)
         self.assertAlmostEqual(timings[1]["start"] - timings[0]["end"], 0.05, places=2)
+
+    def test_edge_tts_retries_empty_audio_then_succeeds(self):
+        calls = {"count": 0}
+
+        class FakeCommunicate:
+            def __init__(self, **_kwargs): pass
+            async def save(self, target):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    raise RuntimeError("No audio was received")
+                Path(target).write_bytes(b"x" * 1024)
+
+        fake_module = types.SimpleNamespace(Communicate=FakeCommunicate)
+        with TemporaryDirectory() as directory, patch.dict(sys.modules, {"edge_tts": fake_module}), patch("ai_services.time.sleep"):
+            output = Path(directory) / "voice.mp3"
+            _synthesize_edge_tts("测试", "voice", 0, output, 30, attempts=2)
+            self.assertGreater(output.stat().st_size, 512)
+        self.assertEqual(calls["count"], 2)
 
 
 if __name__ == "__main__":

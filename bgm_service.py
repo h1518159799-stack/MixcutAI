@@ -1,17 +1,18 @@
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
 from db import connect, now
+from runtime_paths import MediaRuntimeError, get_ffprobe_path
 
 BGM_EXTS = {".mp3", ".wav", ".m4a"}
 
 
 def find_ffprobe(configured=""):
-    if configured and Path(configured).exists():
-        return configured
-    return shutil.which("ffprobe") or ""
+    try:
+        return get_ffprobe_path()
+    except MediaRuntimeError:
+        return ""
 
 
 def scan_bgm_files(folder):

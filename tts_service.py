@@ -1,13 +1,13 @@
 import base64
-import shutil
 import subprocess
 import tempfile
 import wave
 from pathlib import Path
 
 from db import VOICE_DIR, connect
-from runtime_paths import BUNDLED_FFPROBE_EXE
+from runtime_paths import MediaRuntimeError, get_ffprobe_path
 from subprocess_utils import background_process_kwargs
+from task_runtime import run_managed_command
 
 
 class TtsError(RuntimeError):
@@ -26,19 +26,10 @@ def clean_powershell_message(text: str) -> str:
 
 
 def find_ffprobe(configured: str = "") -> str:
-    candidates = [str(configured or "").strip(), str(BUNDLED_FFPROBE_EXE)]
     try:
-        with connect() as conn:
-            row = conn.execute("SELECT value FROM app_settings WHERE key='ffprobe_path'").fetchone()
-            candidates.append(str(row["value"] if row else "").strip())
-            ffmpeg_row = conn.execute("SELECT value FROM app_settings WHERE key='ffmpeg_path'").fetchone()
-            ffmpeg_path = Path(str(ffmpeg_row["value"] if ffmpeg_row else "").strip())
-            if ffmpeg_path.name.lower() == "ffmpeg.exe":
-                candidates.append(str(ffmpeg_path.with_name("ffprobe.exe")))
-    except Exception:
-        pass
-    candidates.append(shutil.which("ffprobe") or "")
-    return next((item for item in candidates if item and Path(item).is_file()), "")
+        return get_ffprobe_path()
+    except MediaRuntimeError:
+        return ""
 
 
 def audio_duration(path: str, ffprobe_path: str = "") -> float:
@@ -48,19 +39,21 @@ def audio_duration(path: str, ffprobe_path: str = "") -> float:
         return 0.0
     ffprobe = find_ffprobe(ffprobe_path)
     if ffprobe:
-        proc = subprocess.run(
-            [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration",
-             "-of", "default=nw=1:nk=1", str(p)],
-            capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=30,
-            **background_process_kwargs(),
-        )
-        if proc.returncode == 0:
+        try:
+            proc = run_managed_command(
+                [ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration",
+                 "-of", "default=nw=1:nk=1", str(p)],
+                timeout=30, error_type=TtsError, failure_message="音频时长检测失败",
+            )
             try:
                 duration = float((proc.stdout or "").strip())
                 if duration > 0:
                     return round(duration, 6)
             except ValueError:
                 pass
+        except Exception:
+            # WAV can still be measured safely from its header below.
+            pass
     if p.suffix.lower() == ".wav":
         try:
             with wave.open(str(p), "rb") as wf:
@@ -105,22 +98,19 @@ $s.Dispose()
     if out.exists():
         out.unlink()
     try:
-        proc = subprocess.run(
+        proc = run_managed_command(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            encoding="utf-8",
-            errors="ignore",
-            **background_process_kwargs(),
+            timeout=120, error_type=TtsError, failure_message="Windows TTS 生成失败",
         )
+    except Exception as exc:
+        raise TtsError(clean_powershell_message(str(exc))) from exc
     finally:
         try:
             text_file.unlink(missing_ok=True)
         except Exception:
             pass
 
-    if proc.returncode != 0 or not out.exists():
+    if not out.exists():
         raise TtsError(clean_powershell_message(proc.stderr or proc.stdout or "Windows TTS 生成失败"))
 
     duration = audio_duration(str(out))

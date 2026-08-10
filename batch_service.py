@@ -8,12 +8,17 @@ import threading
 import time
 from collections.abc import Callable
 
-from db import connect, now
+from db import connect, now, generation_queue_seq_supported, reserve_generation_queue_seqs
+from task_runtime import (
+    ACTIVE_TASK_STATUSES, HEARTBEAT_STALLED_SECONDS, TERMINAL_TASK_STATUSES,
+    canonical_task_status, heartbeat_age_seconds, initialize_task_log,
+    task_health_snapshot, append_task_log,
+)
 
 
 STRATEGIES = {"random", "prefer_unused", "avoid_repeat"}
-TERMINAL_TASK_STATUSES = {"completed", "failed"}
-TERMINAL_BATCH_STATUSES = {"completed", "completed_with_errors", "failed", "cancelled"}
+TERMINAL_BATCH_STATUSES = {"succeeded", "partially_succeeded", "failed", "cancelled"}
+ACTIVE_BATCH_STATUSES = {"queued", "running", "partially_blocked"}
 
 
 def clone_template_for_task(conn, source_template_id: int, task_name: str, timestamp: str) -> int:
@@ -77,7 +82,31 @@ def clone_template_for_task(conn, source_template_id: int, task_name: str, times
     return task_template_id
 
 
-def create_batch_task(data: dict) -> int:
+def _batch_result(conn, batch_id: int, requested_count: int, *, duplicate: bool) -> dict:
+    task_ids = [
+        int(item["task_id"])
+        for item in conn.execute(
+            """SELECT i.task_id FROM batch_task_items i
+               JOIN generation_tasks g ON g.id=i.task_id
+               WHERE i.batch_id=? ORDER BY i.index_no,i.id""",
+            (int(batch_id),),
+        ).fetchall()
+    ]
+    if len(task_ids) != int(requested_count):
+        raise RuntimeError(
+            f"批量任务创建不完整：计划创建 {requested_count} 条，数据库实际写入 {len(task_ids)} 条"
+        )
+    return {
+        "batch_id": int(batch_id),
+        "task_ids": task_ids,
+        "created_count": len(task_ids),
+        "status": "queued",
+        "duplicate": bool(duplicate),
+    }
+
+
+def create_batch_task(data: dict, *, detailed: bool = False) -> int | dict:
+    created_tasks: list[tuple[int, str]] = []
     template_id = int(data.get("template_id") or 0)
     total_count = int(data.get("total_count") or 0)
     if total_count < 1 or total_count > 100:
@@ -87,7 +116,11 @@ def create_batch_task(data: dict) -> int:
         raise ValueError("素材策略不受支持")
     category_ids = sorted({int(value) for value in (data.get("category_ids") or []) if int(value) > 0})
 
+    result: dict | None = None
     with connect() as conn:
+        # Parent batch, child generation tasks and item relations are one atomic
+        # write.  The UI must never observe a committed parent without children.
+        conn.execute("BEGIN IMMEDIATE")
         template = conn.execute("SELECT id,name FROM edit_templates WHERE id=?", (template_id,)).fetchone()
         shots = conn.execute(
             "SELECT id,material_category_id FROM template_shots WHERE template_id=? ORDER BY sort_order,id",
@@ -134,237 +167,418 @@ def create_batch_task(data: dict) -> int:
                     )
 
         name = str(data.get("name") or f"{template['name']} 批量生成 {total_count} 条").strip()
+        category_json = json.dumps(category_ids)
+        duplicate_rows = conn.execute(
+            """SELECT id FROM batch_tasks
+               WHERE template_id=? AND total_count=? AND material_strategy=?
+                  AND category_ids_json=?
+                  AND status IN ('queued','running','partially_blocked','needs_action')
+               ORDER BY id DESC""",
+            (template_id, total_count, strategy, category_json),
+        ).fetchall()
+        for duplicate in duplicate_rows:
+            duplicate_id = int(duplicate["id"])
+            item_count = int(conn.execute(
+                """SELECT COUNT(*) FROM batch_task_items i
+                   JOIN generation_tasks g ON g.id=i.task_id WHERE i.batch_id=?""",
+                (duplicate_id,),
+            ).fetchone()[0])
+            if item_count == total_count:
+                result = _batch_result(conn, duplicate_id, total_count, duplicate=True)
+                conn.commit()
+                return result if detailed else duplicate_id
+            # Preserve malformed historical data for audit, but never reuse it
+            # as a successful creation result.
+            conn.execute(
+                "UPDATE batch_tasks SET status='needs_action',updated_at=? WHERE id=?",
+                (now(), duplicate_id),
+            )
         timestamp = now()
         conn.execute(
             """INSERT INTO batch_tasks(name,template_id,total_count,status,material_strategy,category_ids_json,
-               created_at,updated_at) VALUES(?,?,?,'pending',?,?,?,?)""",
-            (name, template_id, total_count, strategy, json.dumps(category_ids), timestamp, timestamp),
+               continue_on_child_error,created_at,updated_at) VALUES(?,?,?,'queued',?,?,?,?,?)""",
+            (name, template_id, total_count, strategy, category_json,
+             int(bool(data.get('continue_on_child_error', False))), timestamp, timestamp),
         )
         batch_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
         shot_count = len(shots)
+        queue_seqs = reserve_generation_queue_seqs(conn, total_count)
+        queue_seq_enabled = generation_queue_seq_supported(conn)
         for index in range(1, total_count + 1):
             task_name = f"{name} · {index:03d}/{total_count:03d}"
             task_template_id = clone_template_for_task(conn, template_id, task_name, timestamp)
-            conn.execute(
-                """INSERT INTO generation_tasks(template_id,task_name,status,progress,total_shots,created_at,updated_at)
-                   VALUES(?,?,'pending',0,?,?,?)""",
-                (task_template_id, task_name, shot_count, timestamp, timestamp),
-            )
+            if queue_seq_enabled:
+                conn.execute(
+                    """INSERT INTO generation_tasks(template_id,task_name,status,queue_seq,progress,total_shots,created_at,updated_at)
+                       VALUES(?,?,'queued',?,0,?,?,?)""",
+                    (task_template_id, task_name, queue_seqs[index - 1], shot_count, timestamp, timestamp),
+                )
+            else:  # compatibility for isolated legacy fixtures before migration
+                conn.execute(
+                    """INSERT INTO generation_tasks(template_id,task_name,status,progress,total_shots,created_at,updated_at)
+                       VALUES(?,?,'queued',0,?,?,?)""",
+                    (task_template_id, task_name, shot_count, timestamp, timestamp),
+                )
             task_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            created_tasks.append((task_id, task_name))
             conn.execute(
                 """INSERT INTO batch_task_items(batch_id,task_id,index_no,status,created_at,updated_at)
-                   VALUES(?,?,?,'pending',?,?)""",
+                   VALUES(?,?,?,'queued',?,?)""",
                 (batch_id, task_id, index, timestamp, timestamp),
             )
-    return batch_id
+        result = _batch_result(conn, batch_id, total_count, duplicate=False)
+        conn.commit()
+    for task_id, task_name in created_tasks:
+        try:
+            initialize_task_log(task_id, task_name)
+        except OSError:
+            # Log-file initialization must not turn a committed database task
+            # into an apparent task-creation failure.
+            pass
+    if not result:
+        raise RuntimeError("批量任务创建失败：数据库没有返回有效任务")
+    return result if detailed else int(result["batch_id"])
 
 
-def sync_batch(batch_id: int, force_finish: bool = False) -> dict:
+def _canonical_item_status(value: object) -> str:
+    return canonical_task_status(value)
+
+
+def sync_batch(batch_id: int) -> dict:
+    """Persist one authoritative batch summary derived only from child rows."""
     with connect() as conn:
-        counts = conn.execute(
-            """SELECT COUNT(*) total,
-               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
-               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
-               SUM(CASE WHEN status IN ('pending','running') THEN 1 ELSE 0 END) remaining
-               FROM batch_task_items WHERE batch_id=?""",
-            (batch_id,),
+        batch = conn.execute(
+            "SELECT total_count,continue_on_child_error,status FROM batch_tasks WHERE id=?", (int(batch_id),)
         ).fetchone()
-        completed = int(counts["completed"] or 0)
-        failed = int(counts["failed"] or 0)
-        remaining = int(counts["remaining"] or 0)
-        status = "running"
-        finished_at = ""
-        if force_finish or remaining == 0:
-            status = "completed_with_errors" if failed else "completed"
-            finished_at = now()
+        if not batch:
+            return {}
+        rows_ = conn.execute(
+            "SELECT i.status,COALESCE(g.progress,0) progress FROM batch_task_items i "
+            "LEFT JOIN generation_tasks g ON g.id=i.task_id WHERE i.batch_id=? ORDER BY i.index_no",
+            (int(batch_id),),
+        ).fetchall()
+        statuses = [_canonical_item_status(item["status"]) for item in rows_]
+        total = len(statuses) or int(batch["total_count"] or 0)
+        succeeded = statuses.count("succeeded")
+        failed = statuses.count("failed")
+        stalled = statuses.count("stalled")
+        paused = statuses.count("paused")
+        cancelled = statuses.count("cancelled")
+        queued = statuses.count("queued")
+        preparing = statuses.count("preparing")
+        rendering = statuses.count("rendering")
+        verifying = statuses.count("verifying")
+        running = preparing + rendering + verifying
+        continue_on_error = bool(batch["continue_on_child_error"])
+
+        if total and succeeded == total:
+            status = "succeeded"
+        elif running and (stalled or paused or failed):
+            status = "partially_blocked"
+        elif stalled or paused or (failed and queued and not continue_on_error):
+            status = "partially_blocked" if (continue_on_error and (running or queued)) else "needs_action"
+        elif failed and (running or queued) and continue_on_error:
+            status = "partially_blocked"
+        elif running:
+            status = "running"
+        elif queued:
+            status = "queued"
+        elif succeeded and (failed or cancelled):
+            status = "partially_succeeded"
+        elif failed or cancelled:
+            status = "failed"
+        else:
+            status = "queued"
+
+        terminal = status in TERMINAL_BATCH_STATUSES
+        finished_at = now() if terminal else ""
         conn.execute(
             """UPDATE batch_tasks SET completed_count=?,failed_count=?,status=?,updated_at=?,
-               finished_at=CASE WHEN ?<>'' THEN ? ELSE finished_at END WHERE id=?""",
-            (completed, failed, status, now(), finished_at, finished_at, batch_id),
+               finished_at=CASE WHEN ?<>'' THEN ? ELSE '' END WHERE id=?""",
+            (succeeded, failed, status, now(), finished_at, finished_at, int(batch_id)),
         )
-    return {"completed": completed, "failed": failed, "remaining": remaining, "status": status}
+    avg_progress = round(sum(float(item["progress"] or 0) for item in rows_) / max(1, total))
+    return {
+        "total": total, "succeeded": succeeded, "failed": failed, "stalled": stalled,
+        "paused": paused, "cancelled": cancelled, "queued": queued, "running": running,
+        "preparing": preparing, "rendering": rendering, "verifying": verifying,
+        "needs_action": stalled + paused, "progress": avg_progress, "status": status,
+    }
 
 
-def process_batch(batch_id: int, start_generation: Callable[[int], object], poll_interval: float = 0.5) -> None:
+def _sync_items_from_tasks(batch_id: int) -> None:
     with connect() as conn:
-        batch = conn.execute("SELECT * FROM batch_tasks WHERE id=?", (batch_id,)).fetchone()
-        if not batch or batch["status"] in TERMINAL_BATCH_STATUSES:
-            return
-        conn.execute("UPDATE batch_tasks SET status='running',updated_at=? WHERE id=?", (now(), batch_id))
-        items = conn.execute(
-            "SELECT * FROM batch_task_items WHERE batch_id=? ORDER BY index_no,id", (batch_id,)
+        records = conn.execute(
+            """SELECT i.id,g.status,g.output_path,g.error_message
+               FROM batch_task_items i JOIN generation_tasks g ON g.id=i.task_id
+               WHERE i.batch_id=?""", (int(batch_id),)
         ).fetchall()
+        for record in records:
+            status = canonical_task_status(record["status"])
+            conn.execute(
+                "UPDATE batch_task_items SET status=?,output_path=?,error_message=?,updated_at=? WHERE id=?",
+                (status, record["output_path"] or "", record["error_message"] or "", now(), int(record["id"])),
+            )
 
-    for item in items:
-        already_completed = False
+
+def _mark_stalled(task_id: int, item_id: int, age: float) -> None:
+    reason = (
+        f"任务心跳已中断 {int(age)} 秒，Worker、FFmpeg 和 FFprobe 均已退出。"
+        "任务已安全标记为停滞，请查看日志后终止并重试。"
+    )
+    with connect() as conn:
+        conn.execute(
+            """UPDATE generation_tasks SET status='stalled',current_stage='stalled',
+               current_step='任务已停滞',current_shot='任务已停滞',worker_id='',process_id=0,
+               process_name='',ffmpeg_pid=0,ffprobe_pid=0,error_code='WORKER_STALLED',
+               error_message=?,updated_at=? WHERE id=?""",
+            (reason, now(), int(task_id)),
+        )
+        conn.execute(
+            "UPDATE batch_task_items SET status='stalled',error_message=?,updated_at=? WHERE id=?",
+            (reason, now(), int(item_id)),
+        )
+    append_task_log(task_id, f"停滞诊断 · {reason}")
+
+
+def process_batch(batch_id: int, start_generation: Callable[[int], object], poll_interval: float = 0.5) -> str:
+    """Run one batch serially.  Default policy pauses at the first child error."""
+    while True:
         with connect() as conn:
-            current_batch = conn.execute("SELECT status FROM batch_tasks WHERE id=?", (batch_id,)).fetchone()
-            if not current_batch or current_batch["status"] == "cancelled":
-                return
-            task = conn.execute("SELECT * FROM generation_tasks WHERE id=?", (item["task_id"],)).fetchone()
-            if not task:
-                conn.execute(
-                    "UPDATE batch_task_items SET status='failed',error_message='生成任务已被删除',updated_at=? WHERE id=?",
-                    (now(), item["id"]),
-                )
-                already_completed = True
-            elif task["status"] == "completed":
-                conn.execute(
-                    "UPDATE batch_task_items SET status='completed',output_path=?,error_message='',updated_at=? WHERE id=?",
-                    (task["output_path"], now(), item["id"]),
-                )
-                already_completed = True
-            else:
-                conn.execute(
-                    "UPDATE batch_task_items SET status='running',error_message='',updated_at=? WHERE id=?",
-                    (now(), item["id"]),
-                )
-        if already_completed:
-            sync_batch(batch_id)
+            batch = conn.execute("SELECT * FROM batch_tasks WHERE id=?", (int(batch_id),)).fetchone()
+            if not batch:
+                return "missing"
+            if batch["status"] in TERMINAL_BATCH_STATUSES or batch["status"] == "cancelled":
+                return str(batch["status"])
+            items = conn.execute(
+                """SELECT i.*,g.status task_status,g.last_heartbeat_at,g.updated_at task_updated_at
+                   FROM batch_task_items i JOIN generation_tasks g ON g.id=i.task_id
+                   WHERE i.batch_id=? ORDER BY i.index_no,i.id""", (int(batch_id),)
+            ).fetchall()
+        _sync_items_from_tasks(batch_id)
+        summary = sync_batch(batch_id)
+        if not items:
+            return summary.get("status", "failed")
+
+        active_item = next(
+            (item for item in items if canonical_task_status(item["task_status"]) in {"preparing", "rendering", "verifying"}),
+            None,
+        )
+        if active_item:
+            heartbeat_value = str(active_item["last_heartbeat_at"] or active_item["task_updated_at"] or "")
+            age = heartbeat_age_seconds(heartbeat_value)
+            if age is not None and age > HEARTBEAT_STALLED_SECONDS:
+                health = task_health_snapshot(int(active_item["task_id"]))
+                if not any((
+                    health.get("worker_alive"), health.get("process_alive"),
+                    health.get("ffmpeg_alive"), health.get("ffprobe_alive"),
+                )):
+                    _mark_stalled(int(active_item["task_id"]), int(active_item["id"]), age)
+                    result = sync_batch(batch_id)
+                    if not bool(batch["continue_on_child_error"]):
+                        return "needs_action"
+                    continue
+            time.sleep(max(0.05, poll_interval))
             continue
 
-        retry_count = 0
-        try:
-            start_generation(int(item["task_id"]))
-        except Exception as exc:
-            with connect() as conn:
-                conn.execute(
-                    "UPDATE generation_tasks SET status='failed',error_message=?,updated_at=? WHERE id=?",
-                    (str(exc), now(), item["task_id"]),
-                )
+        blocked = next(
+            (item for item in items if canonical_task_status(item["task_status"]) in {"failed", "stalled", "paused"}),
+            None,
+        )
+        if blocked and not bool(batch["continue_on_child_error"]):
+            sync_batch(batch_id)
+            return "needs_action"
 
-        while True:
-            with connect() as conn:
-                task = conn.execute("SELECT * FROM generation_tasks WHERE id=?", (item["task_id"],)).fetchone()
-                batch_status = conn.execute("SELECT status FROM batch_tasks WHERE id=?", (batch_id,)).fetchone()
-            if not batch_status or batch_status["status"] == "cancelled":
-                return
-            if not task:
+        queued_item = next(
+            (item for item in items if canonical_task_status(item["task_status"]) == "queued"),
+            None,
+        )
+        if queued_item:
+            try:
+                result = start_generation(int(queued_item["task_id"])) or {}
+                returned_status = canonical_task_status(
+                    result.get("status", "queued") if isinstance(result, dict) else "queued"
+                )
                 with connect() as conn:
                     conn.execute(
-                        "UPDATE batch_task_items SET status='failed',error_message='生成任务已被删除',updated_at=? WHERE id=?",
-                        (now(), item["id"]),
+                        "UPDATE batch_task_items SET status=?,error_message='',updated_at=? WHERE id=?",
+                        (returned_status, now(), int(queued_item["id"])),
                     )
-                sync_batch(batch_id)
-                break
-            if task and task["status"] in TERMINAL_TASK_STATUSES:
-                if task["status"] == "failed" and retry_count < 1:
-                    retry_count += 1
-                    with connect() as conn:
-                        conn.execute(
-                            """UPDATE generation_tasks SET status='pending',progress=0,current_shot=?,
-                               error_message='',updated_at=? WHERE id=?""",
-                            ("首次失败，正在重新排队", now(), item["task_id"]),
-                        )
-                        conn.execute(
-                            "UPDATE batch_task_items SET status='running',error_message='',updated_at=? WHERE id=?",
-                            (now(), item["id"]),
-                        )
-                    time.sleep(1)
-                    try:
-                        start_generation(int(item["task_id"]))
-                    except Exception as exc:
-                        with connect() as conn:
-                            conn.execute(
-                                "UPDATE generation_tasks SET status='failed',error_message=?,updated_at=? WHERE id=?",
-                                (str(exc), now(), item["task_id"]),
-                            )
-                    continue
-                item_status = "completed" if task["status"] == "completed" else "failed"
+            except BaseException as exc:
+                reason = f"启动生成任务失败：{type(exc).__name__}: {exc}"
                 with connect() as conn:
                     conn.execute(
-                        """UPDATE batch_task_items SET status=?,output_path=?,error_message=?,updated_at=? WHERE id=?""",
-                        (item_status, task["output_path"] or "", task["error_message"] or "", now(), item["id"]),
+                        """UPDATE generation_tasks SET status='failed',current_stage='failed',
+                           current_step='启动失败',error_code='START_FAILED',error_message=?,
+                           finished_at=?,updated_at=? WHERE id=?""",
+                        (reason, now(), now(), int(queued_item["task_id"])),
                     )
+                    conn.execute(
+                        "UPDATE batch_task_items SET status='failed',error_message=?,updated_at=? WHERE id=?",
+                        (reason, now(), int(queued_item["id"])),
+                    )
+                append_task_log(int(queued_item["task_id"]), reason)
                 sync_batch(batch_id)
-                break
+                if not bool(batch["continue_on_child_error"]):
+                    return "needs_action"
             time.sleep(max(0.05, poll_interval))
-    sync_batch(batch_id, force_finish=True)
+            continue
+
+        return sync_batch(batch_id).get("status", "failed")
 
 
 class SerialBatchQueue:
-    """A single-worker queue; only one batch item is generated at a time."""
+    """A durable, one-batch-at-a-time queue backed by database task claims."""
 
     def __init__(self):
         self._queue: queue.Queue[tuple[int, Callable[[int], object]]] = queue.Queue()
         self._lock = threading.Lock()
         self._enqueued: set[int] = set()
         self._thread: threading.Thread | None = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._status = "stopped"
+        self._current_batch_id = 0
+
+    def ensure_started(self) -> bool:
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return False
+            self._stop.clear()
+            self._status = "idle"
+            self._thread = threading.Thread(target=self._worker, name="mixcut-batch-serial", daemon=True)
+            self._thread.start()
+            return True
+
+    def signal(self) -> None:
+        self.ensure_started()
+        self._wake.set()
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "worker_alive": bool(self._thread and self._thread.is_alive()),
+                "worker_status": self._status,
+                "current_batch_id": int(self._current_batch_id or 0),
+                "pending_batches": len(self._enqueued),
+            }
+
+    def stop(self, timeout: float = 3.0) -> None:
+        with self._lock:
+            thread = self._thread
+            self._status = "stopping"
+            self._stop.set()
+            self._wake.set()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout)))
 
     def enqueue(self, batch_id: int, callback: Callable[[int], object]) -> None:
         with self._lock:
-            if batch_id in self._enqueued:
+            if int(batch_id) in self._enqueued:
+                self._wake.set()
                 return
-            self._enqueued.add(batch_id)
-            self._queue.put((batch_id, callback))
-            if not self._thread or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._worker, name="mixcut-batch-serial", daemon=True)
-                self._thread.start()
+            self._enqueued.add(int(batch_id))
+            self._queue.put((int(batch_id), callback))
+        self.ensure_started()
+        self._wake.set()
 
     def _worker(self) -> None:
-        while True:
+        while not self._stop.is_set():
             try:
-                batch_id, callback = self._queue.get(timeout=1)
+                batch_id, callback = self._queue.get(timeout=0.5)
             except queue.Empty:
                 with self._lock:
-                    if self._queue.empty():
-                        self._thread = None
-                        return
+                    self._status = "idle"
+                self._wake.wait(0.5)
+                self._wake.clear()
                 continue
+            with self._lock:
+                self._status = "running"
+                self._current_batch_id = int(batch_id)
             try:
-                process_batch(batch_id, callback)
+                result = process_batch(batch_id, callback)
+                # A default-policy error blocks later batches until the user
+                # retries, cancels, or explicitly changes the batch policy.
+                while result == "needs_action":
+                    time.sleep(1)
+                    with connect() as conn:
+                        current = conn.execute(
+                            "SELECT status FROM batch_tasks WHERE id=?", (int(batch_id),)
+                        ).fetchone()
+                    if not current or current["status"] in TERMINAL_BATCH_STATUSES or current["status"] == "cancelled":
+                        break
+                    if current["status"] in {"queued", "running", "partially_blocked"}:
+                        result = process_batch(batch_id, callback)
+            except BaseException as exc:
+                reason = f"批次队列异常中断：{type(exc).__name__}: {exc}"
+                try:
+                    with connect() as conn:
+                        conn.execute(
+                            "UPDATE batch_tasks SET status='needs_action',updated_at=? WHERE id=?",
+                            (now(), int(batch_id)),
+                        )
+                        conn.execute(
+                            """UPDATE generation_tasks SET status='failed',current_stage='failed',
+                               current_step='批次队列异常',error_code='BATCH_QUEUE_ERROR',
+                               error_message=?,finished_at=?,updated_at=?
+                               WHERE id IN (SELECT task_id FROM batch_task_items WHERE batch_id=?)
+                               AND status IN ('preparing','rendering','verifying')""",
+                            (reason, now(), now(), int(batch_id)),
+                        )
+                except Exception:
+                    pass
             finally:
                 with self._lock:
-                    self._enqueued.discard(batch_id)
+                    self._enqueued.discard(int(batch_id))
+                    self._current_batch_id = 0
+                    self._status = "idle"
                 self._queue.task_done()
+                self._wake.set()
+        with self._lock:
+            self._status = "stopped"
+            self._current_batch_id = 0
+            self._thread = None
 
 
 BATCH_QUEUE = SerialBatchQueue()
 
 
 def recover_and_enqueue(callback: Callable[[int], object]) -> list[int]:
-    """Resume interrupted batches after application restart."""
+    """Recover the serial queue without auto-retrying interrupted children."""
     with connect() as conn:
-        legacy_items = conn.execute(
-            """SELECT i.task_id,g.task_name,b.template_id source_template_id
-               FROM batch_task_items i
-               JOIN batch_tasks b ON b.id=i.batch_id
-               JOIN generation_tasks g ON g.id=i.task_id
-               LEFT JOIN edit_templates t ON t.id=g.template_id
-               WHERE b.status IN ('pending','running')
-                 AND i.status IN ('pending','running')
-                 AND COALESCE(t.is_hidden,0)=0"""
+        interrupted = conn.execute(
+            """SELECT g.id task_id,i.id item_id,i.batch_id
+               FROM generation_tasks g
+               LEFT JOIN batch_task_items i ON i.task_id=g.id
+               WHERE g.status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging')"""
         ).fetchall()
-        for item in legacy_items:
-            cloned_template_id = clone_template_for_task(
-                conn, item["source_template_id"], item["task_name"], now()
-            )
+        for item in interrupted:
+            reason = "软件重启后检测到旧 Worker 已退出，任务执行现场已保留，请诊断后重试。"
             conn.execute(
-                "UPDATE generation_tasks SET template_id=?,updated_at=? WHERE id=?",
-                (cloned_template_id, now(), item["task_id"]),
+                """UPDATE generation_tasks SET status='stalled',current_stage='stalled',
+                   current_step='任务被异常中断',current_shot='等待人工处理',worker_id='',
+                   process_id=0,process_name='',ffmpeg_pid=0,ffprobe_pid=0,
+                   error_code='INTERRUPTED',error_message=?,updated_at=? WHERE id=?""",
+                (reason, now(), int(item["task_id"])),
             )
-        batches = [
-            row["id"]
-            for row in conn.execute(
-                "SELECT id FROM batch_tasks WHERE status IN ('pending','running') ORDER BY id"
-            ).fetchall()
-        ]
-        if batches:
-            marks = ",".join("?" for _ in batches)
-            conn.execute(
-                f"""UPDATE generation_tasks SET status='pending',progress=0,current_shot='',error_message='',updated_at=?
-                    WHERE id IN (SELECT task_id FROM batch_task_items WHERE batch_id IN ({marks}) AND status='running')
-                    AND status NOT IN ('completed','failed')""",
-                (now(), *batches),
-            )
-            conn.execute(
-                f"UPDATE batch_task_items SET status='pending',updated_at=? WHERE batch_id IN ({marks}) AND status='running'",
-                (now(), *batches),
-            )
-            conn.execute(
-                f"UPDATE batch_tasks SET status='pending',updated_at=? WHERE id IN ({marks})",
-                (now(), *batches),
-            )
-    for batch_id in batches:
-        BATCH_QUEUE.enqueue(batch_id, callback)
-    return batches
+            if item["item_id"]:
+                conn.execute(
+                    "UPDATE batch_task_items SET status='stalled',error_message=?,updated_at=? WHERE id=?",
+                    (reason, now(), int(item["item_id"])),
+                )
+        batch_ids = [int(row["id"]) for row in conn.execute(
+            """SELECT b.id,MIN(CASE WHEN COALESCE(g.queue_seq,0)>0 THEN g.queue_seq ELSE g.id END) first_queue_seq
+               FROM batch_tasks b
+               JOIN batch_task_items i ON i.batch_id=b.id
+               JOIN generation_tasks g ON g.id=i.task_id
+               WHERE b.status IN ('queued','running','partially_blocked')
+               GROUP BY b.id
+               ORDER BY first_queue_seq,b.id"""
+        ).fetchall()]
+    recoverable = []
+    for batch_id in batch_ids:
+        summary = sync_batch(batch_id)
+        if summary.get("status") in {"queued", "running", "partially_blocked"}:
+            BATCH_QUEUE.enqueue(batch_id, callback)
+            recoverable.append(batch_id)
+    return recoverable

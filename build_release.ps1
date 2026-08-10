@@ -3,9 +3,11 @@
 $ErrorActionPreference = "Stop"
 
 $AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Python = "C:\Users\Administrator\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-if (-not (Test-Path $Python)) { $Python = (Get-Command python).Source }
-$Version = "1.3.6"
+$Python = [string]$env:MIXCUT_PYTHON
+if (-not $Python -or -not (Test-Path $Python)) {
+    $Python = (Get-Command python -ErrorAction Stop).Source
+}
+$Version = "1.3.12"
 $BuildStamp = Get-Date -Format "yyyyMMddHHmmss"
 $WorkDir = Join-Path $AppDir ("build\pyinstaller_" + $BuildStamp)
 $UpdaterWorkDir = Join-Path $AppDir ("build\updater_" + $BuildStamp)
@@ -24,9 +26,14 @@ try {
     & $Python -m pip install -r requirements-build.txt
     if ($LASTEXITCODE -ne 0) { throw "Dependency install failed" }
     $BrowserCache = Join-Path $AppDir "build\playwright-browsers"
-    $env:PLAYWRIGHT_BROWSERS_PATH = $BrowserCache
-    & $Python -m playwright install chromium
-    if ($LASTEXITCODE -ne 0) { throw "Chromium download failed" }
+    $ExternalChromiumDir = [string]$env:MIXCUT_CHROMIUM_DIR
+    if ($ExternalChromiumDir -and (Test-Path (Join-Path $ExternalChromiumDir "chrome.exe"))) {
+        Write-Host "Using existing bundled Chromium: $ExternalChromiumDir" -ForegroundColor DarkCyan
+    } else {
+        $env:PLAYWRIGHT_BROWSERS_PATH = $BrowserCache
+        & $Python -m playwright install chromium
+        if ($LASTEXITCODE -ne 0) { throw "Chromium download failed" }
+    }
 
     New-Item -ItemType Directory -Path $ReleaseDir -Force | Out-Null
     New-Item -ItemType Directory -Path $StageDir -Force | Out-Null
@@ -72,9 +79,13 @@ try {
     Copy-Item "$ReleaseDir\MixcutAI.exe" "$StageDir\MixcutAI.exe" -Force
     Copy-Item "$ReleaseDir\MixcutUpdater.exe" "$StageDir\MixcutUpdater.exe" -Force
     Copy-Item "$AppDir\default_config.json" "$StageDir\default_config.json" -Force
-    $ChromiumExe = Get-ChildItem -Path $BrowserCache -Recurse -Filter chrome.exe -File |
-        Where-Object { $_.FullName -match "chromium-[^\\]+\\chrome-win" } |
-        Select-Object -First 1
+    if ($ExternalChromiumDir -and (Test-Path (Join-Path $ExternalChromiumDir "chrome.exe"))) {
+        $ChromiumExe = Get-Item (Join-Path $ExternalChromiumDir "chrome.exe")
+    } else {
+        $ChromiumExe = Get-ChildItem -Path $BrowserCache -Recurse -Filter chrome.exe -File |
+            Where-Object { $_.FullName -match "chromium-[^\\]+\\chrome-win" } |
+            Select-Object -First 1
+    }
     if (-not $ChromiumExe) { throw "Downloaded Chromium executable not found" }
     $BundledBrowserDir = Join-Path $StageDir "browser\chromium"
     New-Item -ItemType Directory -Path $BundledBrowserDir -Force | Out-Null
@@ -86,7 +97,11 @@ try {
     ) | Where-Object { $_ -and (Test-Path (Join-Path $_ "ffmpeg.exe")) -and (Test-Path (Join-Path $_ "ffprobe.exe")) }
     if (-not $FFmpegCandidates) {
         $PathFFmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
-        if ($PathFFmpeg) { $FFmpegCandidates = @($PathFFmpeg.Source | Split-Path -Parent) }
+        $PathFFprobe = Get-Command ffprobe.exe -ErrorAction SilentlyContinue
+        if ($PathFFmpeg -and $PathFFprobe -and
+            (($PathFFmpeg.Source | Split-Path -Parent) -eq ($PathFFprobe.Source | Split-Path -Parent))) {
+            $FFmpegCandidates = @($PathFFmpeg.Source | Split-Path -Parent)
+        }
     }
     $ResolvedFFmpegBin = $FFmpegCandidates | Select-Object -First 1
     if (-not $ResolvedFFmpegBin) { throw "FFmpeg/FFprobe source not found. Pass -FFmpegBin <folder>." }
@@ -94,49 +109,23 @@ try {
     New-Item -ItemType Directory -Path $BundledFFmpegDir -Force | Out-Null
     Copy-Item (Join-Path $ResolvedFFmpegBin "ffmpeg.exe") $BundledFFmpegDir -Force
     Copy-Item (Join-Path $ResolvedFFmpegBin "ffprobe.exe") $BundledFFmpegDir -Force
+    foreach ($MediaBinary in @("ffmpeg.exe", "ffprobe.exe")) {
+        $MediaPath = Join-Path $BundledFFmpegDir $MediaBinary
+        if (-not (Test-Path $MediaPath)) { throw "Bundled media runtime missing after copy: $MediaBinary" }
+        & $MediaPath -version 2>$null | Select-Object -First 1 | Write-Host
+        if ($LASTEXITCODE -ne 0) { throw "Bundled media runtime is not executable: $MediaBinary" }
+    }
     foreach ($Document in @("README_使用说明.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt")) {
         Copy-Item (Join-Path $AppDir $Document) (Join-Path $StageDir $Document) -Force
     }
     $UserZip = "$ReleaseDir\MixcutAI-v$Version-win64.zip"
-    @'
-import pathlib, sys, zipfile
-stage = pathlib.Path(sys.argv[1])
-target = pathlib.Path(sys.argv[2])
-material_root = stage / "\u6df7\u526a\u7d20\u6750"
-for category in ("\u64cd\u4f5c\u8fc7\u7a0b", "\u4ea7\u54c1", "\u4ea7\u54c1\u5c55\u793a", "\u5e97\u5185\u73af\u5883", "\u670d\u52a1\u8fc7\u7a0b", "\u7a7a\u955c", "\u95e8\u5934", "\u4eba\u7269"):
-    (material_root / category).mkdir(parents=True, exist_ok=True)
-with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-    for path in sorted(stage.rglob("*"), key=lambda item: item.as_posix()):
-        relative = path.relative_to(stage).as_posix()
-        if path.is_dir():
-            archive.writestr(relative.rstrip("/") + "/", b"")
-        else:
-            archive.write(path, relative)
-'@ | & $Python - $StageDir $UserZip
+    & $Python (Join-Path $AppDir "release_packager.py") create $StageDir $UserZip
     if ($LASTEXITCODE -ne 0) { throw "UTF-8 release ZIP creation failed" }
 
     Write-Host "[6/8] Cloud licensing enabled; no signing key is packaged locally." -ForegroundColor Cyan
 
     Write-Host "[7/8] Verifying package allowlist and forbidden files..." -ForegroundColor Cyan
-    @'
-import sys, zipfile
-path = sys.argv[1]
-allowed_root = {"MixcutAI.exe", "MixcutUpdater.exe", "default_config.json", "README_\u4f7f\u7528\u8bf4\u660e.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt"}
-forbidden = (".py", ".db", ".log", ".env", ".key", ".pem", "license_admin", "production_test", "test_")
-with zipfile.ZipFile(path) as archive:
-    names = [item.filename.replace("\\", "/").strip("/") for item in archive.infolist() if not item.is_dir()]
-unexpected = [name for name in names if name not in allowed_root and not name.startswith("browser/chromium/") and not name.startswith("runtime/ffmpeg/")]
-if unexpected or not allowed_root.issubset(names):
-    raise SystemExit(f"user package allowlist mismatch: {unexpected}")
-if "browser/chromium/chrome.exe" not in names:
-    raise SystemExit("bundled Chromium executable missing")
-for binary in ("runtime/ffmpeg/bin/ffmpeg.exe", "runtime/ffmpeg/bin/ffprobe.exe"):
-    if binary not in names:
-        raise SystemExit(f"bundled media runtime missing: {binary}")
-if any(any(mark in name.lower() for mark in forbidden) for name in names):
-    raise SystemExit(f"forbidden user package entry: {names}")
-print("PACKAGE_ALLOWLIST_OK", len(names), "files; bundled Chromium present")
-'@ | & $Python - $UserZip
+    & $Python (Join-Path $AppDir "release_packager.py") verify $UserZip
     if ($LASTEXITCODE -ne 0) { throw "User package verification failed" }
 
     Write-Host "[8/8] Writing hashes and content manifest..." -ForegroundColor Cyan
@@ -167,7 +156,7 @@ print("PACKAGE_ALLOWLIST_OK", len(names), "files; bundled Chromium present")
     $UpdateJson = [ordered]@{
         version = $Version
         title = "Mixcut AI v$Version"
-        content = "Preserve final TTS tail, add configurable ending hold, and validate final audio-video duration"
+        content = "Keep one long-lived serial generation worker, automatically claim the next queued task, and recover stopped workers"
         download_url = "https://47-107-104-106.sslip.io/updates/MixcutAI.exe"
         sha256 = $ExeHash.ToLowerInvariant()
         force_update = $false
@@ -182,6 +171,4 @@ print("PACKAGE_ALLOWLIST_OK", len(names), "files; bundled Chromium present")
 } finally {
     Pop-Location
 }
-
-
 

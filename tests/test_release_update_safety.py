@@ -105,6 +105,27 @@ def test_updater_replaces_verified_executable(tmp_path, monkeypatch):
     assert current.with_suffix(".exe.bak").read_bytes() == b"old"
 
 
+def test_executable_update_preserves_bundled_media_runtime(tmp_path, monkeypatch):
+    current = tmp_path / "MixcutAI.exe"
+    new = tmp_path / "MixcutAI-new.exe"
+    log = tmp_path / "update.log"
+    media_dir = tmp_path / "runtime" / "ffmpeg" / "bin"
+    media_dir.mkdir(parents=True)
+    ffmpeg = media_dir / "ffmpeg.exe"
+    ffprobe = media_dir / "ffprobe.exe"
+    ffmpeg.write_bytes(b"bundled-ffmpeg")
+    ffprobe.write_bytes(b"bundled-ffprobe")
+    current.write_bytes(b"old")
+    new.write_bytes(b"new")
+    digest = hashlib.sha256(b"new").hexdigest()
+    monkeypatch.setattr(updater_main, "launch", lambda _path: _RunningProcess())
+    monkeypatch.setattr(updater_main.time, "sleep", lambda _seconds: None)
+
+    assert updater_main.replace_with_rollback(current, new, digest, log) == 0
+    assert ffmpeg.read_bytes() == b"bundled-ffmpeg"
+    assert ffprobe.read_bytes() == b"bundled-ffprobe"
+
+
 def test_updater_restores_old_executable_when_new_version_fails(tmp_path, monkeypatch):
     current = tmp_path / "MixcutAI.exe"
     new = tmp_path / "MixcutAI-new.exe"

@@ -21,6 +21,67 @@ from publish_safety import (
 SUPPORTED_PLATFORM_CODES = {"douyin", "tiktok", "youtube", "instagram", "facebook", "xiaohongshu", "kuaishou", "wechat_channels", "bilibili"}
 TASK_STATUSES = {"pending", "queued", "publishing", "success", "failed", "draft", "prechecking", "ready", "uploading", "submitting", "processing", "waiting_confirmation", "succeeded", "needs_login", "needs_manual_action", "cancelled"}
 CREATE_TASK_LOCK = threading.Lock()
+BATCH_QUEUED_STATUSES = {"pending", "ready", "queued", "prechecking"}
+BATCH_RUNNING_STATUSES = {"publishing", "uploading", "submitting", "processing", "waiting_confirmation"}
+BATCH_SUCCESS_STATUSES = {"success", "succeeded"}
+BATCH_NEEDS_ACTION_STATUSES = {"needs_login", "needs_manual_action"}
+BATCH_SKIPPED_STATUSES = {"skipped", "blocked"}
+
+
+def recalculate_group_batch(conn, batch_id: int) -> dict:
+    states = [str(row["status"] or "pending") for row in conn.execute(
+        "SELECT status FROM publish_group_batch_items WHERE batch_id=?", (batch_id,)
+    ).fetchall()]
+    counts = {
+        "total_count": len(states),
+        "queued_count": sum(state in BATCH_QUEUED_STATUSES for state in states),
+        "running_count": sum(state in BATCH_RUNNING_STATUSES for state in states),
+        "succeeded_count": sum(state in BATCH_SUCCESS_STATUSES for state in states),
+        "failed_count": sum(state == "failed" for state in states),
+        "skipped_count": sum(state in BATCH_SKIPPED_STATUSES for state in states),
+        "needs_action_count": sum(state in BATCH_NEEDS_ACTION_STATUSES for state in states),
+    }
+    actual = counts["total_count"] - counts["skipped_count"]
+    cancelled = sum(state == "cancelled" for state in states)
+    if counts["queued_count"] or counts["running_count"] or counts["needs_action_count"]:
+        status = "publishing"
+    elif counts["total_count"] and counts["skipped_count"] == counts["total_count"]:
+        status = "all_skipped"
+    elif actual and counts["succeeded_count"] == actual and counts["skipped_count"] == 0:
+        status = "succeeded"
+    elif counts["succeeded_count"]:
+        status = "partial_success"
+    elif actual and counts["failed_count"] == actual:
+        status = "failed"
+    elif cancelled and cancelled + counts["skipped_count"] == counts["total_count"]:
+        status = "cancelled"
+    else:
+        status = "pending"
+    stamp = now()
+    finished = "" if status in {"pending", "publishing"} else stamp
+    conn.execute(
+        """UPDATE publish_group_batches SET total_count=?,queued_count=?,running_count=?,
+           succeeded_count=?,success_count=?,failed_count=?,skipped_count=?,needs_action_count=?,
+           status=?,updated_at=?,finished_at=? WHERE id=?""",
+        (counts["total_count"], counts["queued_count"], counts["running_count"],
+         counts["succeeded_count"], counts["succeeded_count"], counts["failed_count"],
+         counts["skipped_count"], counts["needs_action_count"], status, stamp, finished, batch_id),
+    )
+    return {**counts, "status": status}
+
+
+def sync_group_item_for_task(conn, task_id: int, status: str, error_message: str = "", error_code: str = "") -> None:
+    item = conn.execute(
+        "SELECT batch_id FROM publish_group_batch_items WHERE task_id=?", (task_id,)
+    ).fetchone()
+    if not item:
+        return
+    conn.execute(
+        """UPDATE publish_group_batch_items SET status=?,blocked_reason=?,error_code=?,updated_at=?
+           WHERE task_id=?""",
+        (status, str(error_message or ""), str(error_code or ""), now(), task_id),
+    )
+    recalculate_group_batch(conn, int(item["batch_id"]))
 
 
 def normalize_tags(value) -> list[str]:
@@ -52,7 +113,7 @@ def _create_publish_task(data: dict) -> int:
             "SELECT id,task_name,output_path,status FROM generation_tasks WHERE id=?",
             (generation_task_id,),
         ).fetchone()
-        if not video or video["status"] != "completed" or not video["output_path"]:
+        if not video or video["status"] not in {"succeeded", "completed"} or not video["output_path"]:
             raise ValueError("所选视频尚未生成完成")
         video_path = Path(video["output_path"])
         if not video_path.is_file():
@@ -175,7 +236,35 @@ def enqueue_publish_task(task_id: int) -> dict:
                 (stamp, task_id),
             )
             status = "queued"
+        sync_group_item_for_task(conn, task_id, status)
     return {"id": task_id, "status": status}
+
+
+def retry_group_batch_failed(batch_id: int) -> dict:
+    """Retry failed executable tasks only; successful and skipped rows stay untouched."""
+    with connect() as conn:
+        task_ids = [int(row["task_id"]) for row in conn.execute(
+            """SELECT task_id FROM publish_group_batch_items
+               WHERE batch_id=? AND status='failed' AND task_id IS NOT NULL ORDER BY id""",
+            (batch_id,),
+        ).fetchall()]
+    retried = []
+    errors = []
+    for task_id in task_ids:
+        try:
+            enqueue_publish_task(task_id)
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE publish_group_batch_items SET retry_count=retry_count+1,updated_at=? WHERE batch_id=? AND task_id=?",
+                    (now(), batch_id, task_id),
+                )
+                recalculate_group_batch(conn, batch_id)
+            retried.append(task_id)
+        except Exception as exc:
+            errors.append({"task_id": task_id, "error": str(exc)})
+    if retried:
+        PUBLISH_WORKER.wake()
+    return {"batch_id": batch_id, "retried_task_ids": retried, "errors": errors}
 
 
 def delete_publish_task(task_id: int) -> None:
@@ -196,6 +285,11 @@ def sync_missing_publish_videos() -> dict:
     The output folder is the source of truth here. This deliberately does not
     scan or delete ``generation_tasks`` records.
     """
+    # Manual sync is only a fallback. Normal registration happens in the
+    # generation success callback before the worker claims another task.
+    from generation_success_service import repair_missing_publish_records
+
+    repair_result = repair_missing_publish_records()
     removable_statuses = {"pending", "queued", "failed"}
     conn = connect()
     try:
@@ -213,6 +307,8 @@ def sync_missing_publish_videos() -> dict:
                 "removed_publish_tasks": 0,
                 "removed_publish_task_ids": [],
                 "skipped_publishing_tasks": 0,
+                "repaired_publish_records": repair_result["repaired_count"],
+                "repaired_task_ids": repair_result["repaired_task_ids"],
                 "message": "输出目录未配置或不存在，未删除发布记录",
             }
         video_extensions = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
@@ -249,6 +345,9 @@ def sync_missing_publish_videos() -> dict:
         "removed_publish_tasks": len(removed_ids),
         "removed_publish_task_ids": removed_ids,
         "skipped_publishing_tasks": len(skipped_publishing_ids),
+        "repaired_publish_records": repair_result["repaired_count"],
+        "repaired_task_ids": repair_result["repaired_task_ids"],
+        "repair_skipped": repair_result["skipped"],
     }
 
 
@@ -298,6 +397,14 @@ def _finish_task(task_id: int) -> None:
             "UPDATE publish_tasks SET status=?,success_count=?,failed_count=?,finished_at=?,updated_at=? WHERE id=?",
             (status, success, failed, stamp, stamp, task_id),
         )
+        task_error = conn.execute(
+            "SELECT last_error,error_code FROM publish_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        sync_group_item_for_task(
+            conn, task_id, status,
+            task_error["last_error"] if task_error else "",
+            task_error["error_code"] if task_error else "",
+        )
         task = conn.execute(
             "SELECT video_path,delete_after_publish FROM publish_tasks WHERE id=?", (task_id,)
         ).fetchone()
@@ -340,12 +447,14 @@ def process_guarded_domestic_channel(channel: dict) -> None:
             with connect() as state_conn:
                 state_conn.execute("UPDATE publish_channels SET status=?,updated_at=? WHERE id=?", (state, now(), channel_id))
                 state_conn.execute("UPDATE publish_tasks SET status=?,updated_at=? WHERE id=?", (state, now(), task_id))
+                sync_group_item_for_task(state_conn, task_id, state)
 
         metadata["state_callback"] = advance
         result = preflight_publish_check(dict(account), account, task["video_path"], metadata, allow_unverified=False, check_duplicate=False)
         with connect() as conn:
             conn.execute("UPDATE publish_channels SET status='uploading',error_code='',updated_at=? WHERE id=?", (now(), channel_id))
             conn.execute("UPDATE publish_tasks SET status='uploading',updated_at=? WHERE id=?", (now(), task_id))
+            sync_group_item_for_task(conn, task_id, "uploading")
         publisher_result = get_publisher(channel["platform_code"]).publish(task["video_path"], account, metadata) or {}
         if publisher_result.get("verified") is not True or publisher_result.get("backend_confirmed") is not True or not publisher_result.get("id") or not publisher_result.get("url"):
             raise PublishGuardError("SUBMIT_FAILED", "平台未返回可确认的真实作品ID和作品链接")
@@ -383,6 +492,7 @@ def process_queued_channel(channel: dict) -> None:
     with connect() as conn:
         conn.execute("UPDATE publish_channels SET status='publishing',started_at=?,updated_at=? WHERE id=?", (stamp, stamp, channel_id))
         conn.execute("UPDATE publish_tasks SET status='publishing',updated_at=? WHERE id=?", (stamp, task_id))
+        sync_group_item_for_task(conn, task_id, "publishing")
         account = conn.execute(
             "SELECT a.*,p.code platform_code FROM publish_accounts a JOIN platforms p ON p.id=a.platform_id WHERE a.id=?",
             (channel["account_id"],),
@@ -465,4 +575,15 @@ def start_publish_worker() -> None:
                 "UPDATE publish_tasks SET status='failed',last_error=?,failed_count=1,success_count=0,updated_at=? WHERE id=?",
                 (message, now(), item["publish_task_id"]),
             )
+        conn.execute(
+            """UPDATE publish_group_batch_items
+               SET status=COALESCE((SELECT status FROM publish_tasks WHERE id=publish_group_batch_items.task_id),status),
+                   blocked_reason=CASE WHEN task_id IS NOT NULL THEN COALESCE((SELECT last_error FROM publish_tasks WHERE id=publish_group_batch_items.task_id),'') ELSE blocked_reason END,
+                   error_code=CASE WHEN task_id IS NOT NULL THEN COALESCE((SELECT error_code FROM publish_tasks WHERE id=publish_group_batch_items.task_id),'') ELSE error_code END,
+                   updated_at=?
+               WHERE task_id IS NOT NULL""",
+            (now(),),
+        )
+        for batch in conn.execute("SELECT id FROM publish_group_batches").fetchall():
+            recalculate_group_batch(conn, int(batch["id"]))
     PUBLISH_WORKER.start()

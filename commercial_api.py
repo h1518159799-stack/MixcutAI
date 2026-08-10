@@ -10,24 +10,28 @@ import re
 import sqlite3
 import subprocess
 import threading
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from db import APP_DIR, DB_PATH, THUMB_DIR, VOICE_DIR, connect, init_db, now
+from db import (
+    APP_DIR, DB_PATH, THUMB_DIR, VOICE_DIR, connect, init_db, now,
+    generation_queue_seq_supported, reserve_generation_queue_seqs,
+)
 from bgm_service import scan_bgm_folder
 from sfx_service import scan_sfx_folder
 from subtitle_service import generate_ass_for_shot, generate_ass_from_segments, split_text, subtitle_signature
 from tts_service import audio_duration, synthesize_windows_tts
 from video_engine import find_ffmpeg, generate_video, title_config_from_settings
 from timeline_engine import ffmpeg_filter_path, render_title_ass
-from video_scan import make_thumbnail, probe_video, quick_hash, scan_video_files
+from video_scan import make_thumbnail, make_thumbnail_with_status, probe_video, quick_hash, scan_video_files
 from ai_services import concatenate_tts_wavs, chat_completion, synthesize_tts, test_ai_service, test_tts_service
-from runtime_paths import RESOURCE_DIR
+from runtime_paths import RESOURCE_DIR, get_media_runtime_status
 from subprocess_utils import background_process_kwargs
-from batch_service import BATCH_QUEUE, create_batch_task, recover_and_enqueue
+from batch_service import BATCH_QUEUE, create_batch_task, recover_and_enqueue, sync_batch
 from update_service import UpdateError, UpdateManifest, check_for_update, configured_manifest_url, current_version, stage_and_launch
 from browser_profile_service import (
     detect_login_status,
@@ -36,23 +40,69 @@ from browser_profile_service import (
     profile_path,
     publishing_capabilities,
 )
-from oauth_service import authorization_status, cancel_authorization, complete_authorization, start_authorization
+from tiktok_login_service import (
+    cancel_tiktok_login,
+    launch_tiktok_login,
+    probe_tiktok_login,
+    tiktok_login_status,
+)
+from domestic_login_service import (
+    SUPPORTED_PLATFORMS as DOMESTIC_LOGIN_PLATFORMS,
+    cancel_domestic_login,
+    domestic_login_status,
+    domestic_profile_path,
+    launch_domestic_login,
+    probe_domestic_login,
+)
+from oauth_service import (
+    authorization_status, cancel_authorization, complete_authorization,
+    import_google_oauth_payload, provider_preflight, reopen_authorization,
+    save_provider_config, select_oauth_account, session_status, start_authorization,
+)
 from oauth_token_store import protect
 from config_secret_store import encrypt_secret, public_service_config, runtime_service_config
 from aliyun_bailian_tts import list_voices as list_bailian_voices
 from platforms import adapter_catalog, get_adapter
 from publishers import publisher_catalog
 from publishers.youtube import verify_youtube_account
-from publish_queue import PUBLISH_WORKER, create_publish_task, delete_publish_task, enqueue_publish_task, start_publish_worker, sync_missing_publish_videos
-from ai_publish_service import generate_publish_content
+from publish_queue import (
+    PUBLISH_WORKER, create_publish_task, delete_publish_task, enqueue_publish_task,
+    recalculate_group_batch, retry_group_batch_failed, start_publish_worker,
+    sync_missing_publish_videos,
+)
+from ai_publish_service import PublishAIError, generate_publish_content
+from publish_metadata_service import attach_and_schedule, save_draft_field
+from generation_success_service import repair_missing_publish_records
 from cover_service import normalize_cover_path
 from script_segmentation import AI_SEGMENTATION_INSTRUCTION, smart_segment_text
 from language_service import LANGUAGE_VOICE_PREFIXES, contains_cjk, detect_text_language, voice_matches_language
 from voice_clone_service import clone_minimax_voice
+from smart_split_api import smart_split_get, smart_split_post
+from smart_split_service import recover_smart_split_jobs
 from platform_test_service import create_platform_test, is_admin_mode, list_test_runs, platform_support, retry_platform_test
+from task_runtime import (
+    TaskCancelled, cancel_task, check_cancelled, heartbeat, heartbeat_state,
+    task_context, terminate_process, worker_is_alive, initialize_task_log, append_task_log,
+    fail_task, task_log_path, canonical_task_status, task_health_snapshot,
+    ACTIVE_TASK_STATUSES, GENERATION_QUEUE, MAX_GENERATION_CONCURRENCY,
+    generation_worker_snapshot, append_generation_worker_log,
+)
 
 
-MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".wav", ".mp3", ".m4a", ".ass", ".srt"}
+MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm", ".wmv", ".mpeg", ".mpg", ".wav", ".mp3", ".m4a", ".ass", ".srt"}
+GROUP_BATCH_LOCK = threading.Lock()
+GENERATION_START_LOCK = threading.RLock()
+MATERIAL_SCAN_LOCK = threading.Lock()
+RECENT_COMPLETED_LIMIT = 10
+TASK_CENTER_PAGE_SIZE = 20
+TASK_CENTER_ACTIVE_STATUSES = {
+    "queued", "preparing", "rendering", "verifying", "paused", "failed", "stalled",
+    "needs_action", "needs_manual_action", "interrupted", "running", "partially_blocked",
+}
+GENERATION_WATCHDOG_INTERVAL_SECONDS = 5.0
+_GENERATION_WATCHDOG_LOCK = threading.Lock()
+_GENERATION_WATCHDOG_THREAD: threading.Thread | None = None
+_GENERATION_WATCHDOG_STOP = threading.Event()
 
 
 def rows(sql: str, args=()):
@@ -160,6 +210,135 @@ def settings() -> dict[str, str]:
     return {r["key"]: r["value"] for r in rows("SELECT key,value FROM app_settings")}
 
 
+def public_settings() -> dict[str, str]:
+    """Settings safe for the ordinary UI; runtime binary paths are internal."""
+    values = settings()
+    values.pop("ffmpeg_path", None)
+    values.pop("ffprobe_path", None)
+    return values
+
+
+TITLE_TEMPLATE_SCOPES = {"domestic", "overseas"}
+TITLE_TEMPLATE_KEYS = (
+    "title_main", "title_sub", "title_font_dir", "title_font", "title_font_size",
+    "title_color", "title_auto_fit", "title_background_enabled",
+    "title_background_color", "title_background_opacity",
+    "title_background_padding_y", "title_center", "title_outline_width",
+    "title_outline_color", "title_shadow_color", "title_shadow_x",
+    "title_shadow_y", "title_main_x", "title_main_y", "title_sub_x",
+    "title_sub_y", "subtitle_enabled", "subtitle_font", "subtitle_font_size",
+    "subtitle_color", "subtitle_outline_width", "subtitle_outline_color",
+    "subtitle_margin_bottom", "subtitle_max_chars_per_line", "subtitle_effect",
+    "subtitle_effect_duration",
+)
+
+
+def normalize_title_template_scope(value: str | None) -> str:
+    scope = str(value or "domestic").strip().lower()
+    if scope == "international":  # compatibility with v1.3.7 clients/data
+        scope = "overseas"
+    if scope not in TITLE_TEMPLATE_SCOPES:
+        raise ValueError("标题字幕模板类型无效")
+    return scope
+
+
+def title_template_config(scope: str, values: dict[str, str] | None = None) -> dict[str, str]:
+    scope = normalize_title_template_scope(scope)
+    values = values or settings()
+    legacy_prefix = "international_" if scope == "overseas" else ""
+    result = {}
+    for key in TITLE_TEMPLATE_KEYS:
+        scoped = values.get(f"{scope}_{key}")
+        if scoped is None and legacy_prefix:
+            scoped = values.get(f"{legacy_prefix}{key}")
+        result[key] = str(scoped if scoped is not None else values.get(key, ""))
+    font_dir = str(result.get("title_font_dir") or "").strip()
+    result["font_dir_available"] = "1" if not font_dir or Path(font_dir).is_dir() else "0"
+    return result
+
+
+def activate_title_template(scope: str) -> dict:
+    """Activate one saved scope without changing the other scope."""
+    scope = normalize_title_template_scope(scope)
+    current = settings()
+    config = title_template_config(scope, current)
+    stamp = now()
+    with connect() as conn:
+        for key in TITLE_TEMPLATE_KEYS:
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, str(config.get(key, "")), stamp),
+            )
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('title_style_preset',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            (scope, stamp),
+        )
+    return {"scope": scope, "config": title_template_config(scope), "settings": settings()}
+
+
+def save_title_template(data: dict) -> dict:
+    scope = normalize_title_template_scope(data.get("template_scope"))
+    incoming = data.get("config")
+    if not isinstance(incoming, dict):
+        raise ValueError("标题字幕模板配置格式无效")
+    current = settings()
+    saved = title_template_config(scope, current)
+    for key in TITLE_TEMPLATE_KEYS:
+        if key in incoming:
+            saved[key] = str(incoming.get(key, ""))
+    stamp = now()
+    with connect() as conn:
+        for key in TITLE_TEMPLATE_KEYS:
+            value = saved[key]
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (f"{scope}_{key}", value, stamp),
+            )
+            # The rendering pipeline continues to consume the established flat
+            # keys; only the explicitly active scope is projected onto them.
+            conn.execute(
+                "INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, value, stamp),
+            )
+        conn.execute(
+            "INSERT INTO app_settings(key,value,updated_at) VALUES('title_style_preset',?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            (scope, stamp),
+        )
+    return {"scope": scope, "config": title_template_config(scope), "settings": settings()}
+
+
+def reset_title_template(scope: str) -> dict:
+    scope = normalize_title_template_scope(scope)
+    defaults = {
+        "title_main": "", "title_sub": "", "title_font_dir": "",
+        "title_font": "Microsoft YaHei", "title_font_size": "118",
+        "title_color": "#FFE67A", "title_auto_fit": "0",
+        "title_background_enabled": "0", "title_background_color": "#16B8B8",
+        "title_background_opacity": "72", "title_background_padding_y": "22",
+        "title_center": "1", "title_outline_width": "1",
+        "title_outline_color": "#000000", "title_shadow_color": "#F15A24",
+        "title_shadow_x": "2", "title_shadow_y": "2", "title_main_x": "50",
+        "title_main_y": "13", "title_sub_x": "50", "title_sub_y": "21",
+        "subtitle_enabled": "1", "subtitle_font": "Microsoft YaHei",
+        "subtitle_font_size": "78", "subtitle_color": "#FFFFFF",
+        "subtitle_outline_width": "1", "subtitle_outline_color": "#000000",
+        "subtitle_margin_bottom": "446", "subtitle_max_chars_per_line": "14",
+        "subtitle_effect": "none", "subtitle_effect_duration": "160",
+    }
+    if scope == "overseas":
+        defaults.update({
+            "title_font": "Arial", "title_font_size": "92", "title_auto_fit": "1",
+            "subtitle_font": "Arial", "subtitle_font_size": "58",
+            "subtitle_max_chars_per_line": "24", "subtitle_outline_width": "2",
+        })
+    return save_title_template({"template_scope": scope, "config": defaults})
+
+
 def publishing_accounts() -> list[dict]:
     accounts = rows(
         """SELECT a.*,p.code platform_code,p.name platform_name,p.region,
@@ -171,10 +350,246 @@ def publishing_accounts() -> list[dict]:
     )
     for account in accounts:
         if account.get("integration_type") == "api":
+            # Never expose the stored API secret or encrypted config blob to the UI.
+            # The account screen only needs a configuration-state flag and the
+            # read-only callback address.
+            try:
+                api_config = json.loads(str(account.get("api_config_json") or "{}"))
+            except Exception:
+                api_config = {}
+            preflight = provider_preflight(str(account.get("platform_code") or ""), int(account["id"]))
+            account["api_configured"] = bool(preflight["developer_configured"])
+            account["oauth_redirect_uri"] = preflight["callback_uri"]
+            account["oauth_state"] = preflight["status"]
+            account.pop("api_config_json", None)
             account["authorization_status"] = authorization_status(int(account["id"]))["status"]
             account["login_status"] = "not_applicable"
     return accounts
 
+
+def publishing_account_groups() -> list[dict]:
+    """Return group summaries plus account rows for the account management UI."""
+    groups = rows("SELECT * FROM publish_account_groups WHERE enabled=1 ORDER BY updated_at DESC,id DESC")
+    members = rows(
+        """SELECT m.group_id,m.account_id,m.enabled,m.sort_order,
+                  a.account_name,a.login_status,a.authorization_status,a.last_checked_at,
+                  p.code platform_code,p.name platform_name,p.capability_status,p.integration_type
+           FROM publish_account_group_members m
+           JOIN publish_accounts a ON a.id=m.account_id AND a.status='active'
+           JOIN platforms p ON p.id=a.platform_id AND p.enabled=1
+           WHERE m.enabled=1 ORDER BY m.group_id,m.sort_order,m.id"""
+    )
+    for group in groups:
+        group_members = [item for item in members if int(item["group_id"]) == int(group["id"])]
+        for item in group_members:
+            allowed, error_code, reason = _group_member_gate(item)
+            item.update({"publishable": allowed, "error_code": error_code, "blocked_reason": reason})
+        group["members"] = group_members
+        group["account_count"] = len(group_members)
+        group["publishable_count"] = sum(1 for item in group_members if item.get("publishable"))
+        group["needs_login_count"] = sum(1 for item in group_members if item.get("integration_type") == "browser" and item.get("login_status") != "logged_in")
+        group["untested_count"] = sum(1 for item in group_members if item.get("capability_status") != "passed")
+        group["platforms"] = list(dict.fromkeys(item.get("platform_name") or item.get("platform_code") for item in group_members))
+    return groups
+
+
+def save_account_group(data: dict, group_id: int | None = None) -> int:
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("分组名称不能为空")
+    account_ids = sorted({int(value) for value in data.get("account_ids", []) if int(value) > 0})
+    stamp = now()
+    with connect() as conn:
+        duplicate = conn.execute(
+            "SELECT id FROM publish_account_groups WHERE name=? AND id<>COALESCE(?,0)",
+            (name, group_id or 0),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("已存在同名分组，请换一个名称")
+        if group_id:
+            if not conn.execute("SELECT 1 FROM publish_account_groups WHERE id=? AND enabled=1", (group_id,)).fetchone():
+                raise ValueError("发布分组不存在")
+            conn.execute("UPDATE publish_account_groups SET name=?,description=?,updated_at=? WHERE id=?", (name, str(data.get("description") or "").strip(), stamp, group_id))
+        else:
+            cursor = conn.execute("INSERT INTO publish_account_groups(name,description,enabled,created_at,updated_at) VALUES(?,?,1,?,?)", (name, str(data.get("description") or "").strip(), stamp, stamp))
+            group_id = int(cursor.lastrowid)
+        if account_ids:
+            marks = ",".join("?" for _ in account_ids)
+            existing = conn.execute(f"SELECT id FROM publish_accounts WHERE status='active' AND id IN ({marks})", tuple(account_ids)).fetchall()
+            if len(existing) != len(account_ids):
+                raise ValueError("部分账号不存在或已删除")
+        conn.execute("DELETE FROM publish_account_group_members WHERE group_id=?", (group_id,))
+        for order, account_id in enumerate(account_ids):
+            conn.execute("INSERT INTO publish_account_group_members(group_id,account_id,enabled,sort_order,created_at) VALUES(?,?,1,?,?)", (group_id, account_id, order, stamp))
+    return int(group_id)
+
+
+def copy_account_group(group_id: int) -> int:
+    source = row("SELECT * FROM publish_account_groups WHERE id=? AND enabled=1", (group_id,))
+    if not source:
+        raise ValueError("发布分组不存在")
+    members = rows("SELECT account_id FROM publish_account_group_members WHERE group_id=? AND enabled=1 ORDER BY sort_order,id", (group_id,))
+    base = f"{source['name']} 副本"
+    name = base
+    index = 2
+    while row("SELECT id FROM publish_account_groups WHERE name=?", (name,)):
+        name = f"{base}{index}"
+        index += 1
+    return save_account_group({"name": name, "description": source.get("description") or "", "account_ids": [item["account_id"] for item in members]})
+
+
+def delete_account_group(group_id: int) -> None:
+    with connect() as conn:
+        if conn.execute(
+            "UPDATE publish_account_groups SET enabled=0,updated_at=? WHERE id=? AND enabled=1",
+            (now(), group_id),
+        ).rowcount != 1:
+            raise ValueError("???????")
+        conn.execute("DELETE FROM publish_account_group_members WHERE group_id=?", (group_id,))
+
+
+def _group_member_gate(account: dict) -> tuple[bool, str, str]:
+    capability = str(account.get("capability_status") or "untested")
+    if capability == "untested":
+        return False, "PLATFORM_UNTESTED", "??????????"
+    if capability == "failed":
+        return False, "PLATFORM_FAILED", "??????"
+    if capability == "limited":
+        return False, "PLATFORM_LIMITED", "???????????"
+    if capability != "passed":
+        return False, "PLATFORM_UNTESTED", "??????????"
+    if str(account.get("integration_type") or "browser") == "api":
+        if str(account.get("authorization_status") or "") != "authorized":
+            return False, "OAUTH_EXPIRED", "OAuth?????"
+    elif str(account.get("login_status") or "") != "logged_in":
+        return False, "AUTH_EXPIRED", "??????"
+    return True, "", ""
+
+
+def _group_members(group_id: int, selected_account_ids=None) -> list[dict]:
+    members = rows(
+        """SELECT a.id account_id,a.account_name,a.platform_id,p.code platform_code,
+                  p.name platform_name,p.capability_status,p.integration_type,
+                  a.login_status,a.authorization_status
+           FROM publish_account_group_members m
+           JOIN publish_accounts a ON a.id=m.account_id AND a.status='active'
+           JOIN platforms p ON p.id=a.platform_id AND p.enabled=1
+           WHERE m.group_id=? AND m.enabled=1 ORDER BY m.sort_order,m.id""",
+        (group_id,),
+    )
+    selected = {int(value) for value in (selected_account_ids or []) if int(value) > 0}
+    if selected:
+        members = [item for item in members if int(item["account_id"]) in selected]
+    for item in members:
+        allowed, error_code, reason = _group_member_gate(item)
+        item.update({"publishable": allowed, "error_code": error_code, "blocked_reason": reason})
+    return members
+
+
+def group_publish_preflight(data: dict) -> dict:
+    group_id = int(data.get("group_id") or 0)
+    group = row("SELECT * FROM publish_account_groups WHERE id=? AND enabled=1", (group_id,))
+    if not group:
+        raise ValueError("???????")
+    members = _group_members(group_id, data.get("selected_account_ids"))
+    if not members:
+        raise ValueError("????????")
+    publishable = [item for item in members if item["publishable"]]
+    blocked = [item for item in members if not item["publishable"]]
+    return {
+        "group": group, "members": members, "publishable": publishable, "blocked": blocked,
+        "total_count": len(members), "publishable_count": len(publishable), "blocked_count": len(blocked),
+    }
+
+
+def _group_batch_key(data: dict, account_ids: list[int]) -> str:
+    identity = {
+        "group_id": int(data.get("group_id") or 0),
+        "generation_task_id": int(data.get("generation_task_id") or 0),
+        "account_ids": sorted(account_ids),
+        "title": str(data.get("title") or "").strip(),
+        "scheduled_at": str(data.get("scheduled_at") or "").strip().replace("T", " "),
+    }
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _group_batch_result(batch_id: int, *, duplicate: bool = False) -> dict:
+    batch = row("SELECT * FROM publish_group_batches WHERE id=?", (batch_id,)) or {}
+    items = rows("SELECT * FROM publish_group_batch_items WHERE batch_id=? ORDER BY id", (batch_id,))
+    task_ids = [int(item["task_id"]) for item in items if item.get("task_id")]
+    return {
+        "batch_id": batch_id, "batch": batch, "items": items, "task_ids": task_ids,
+        "publishable": [item for item in items if item.get("task_id")],
+        "blocked": [item for item in items if item.get("status") in {"skipped", "blocked"}],
+        "duplicate": duplicate,
+    }
+
+
+def _create_group_publish_batch(data: dict) -> dict:
+    preview = group_publish_preflight(data)
+    group_id = int(preview["group"]["id"])
+    member_rows = preview["members"]
+    key = _group_batch_key(data, [int(item["account_id"]) for item in member_rows])
+    duplicate = row("SELECT id FROM publish_group_batches WHERE idempotency_key=? ORDER BY id DESC LIMIT 1", (key,))
+    if duplicate:
+        return _group_batch_result(int(duplicate["id"]), duplicate=True)
+    stamp = now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """INSERT INTO publish_group_batches(name,group_id,total_count,idempotency_key,status,created_at,updated_at)
+               VALUES(?,?,?,?, 'pending',?,?)""",
+            (preview["group"]["name"], group_id, len(member_rows), key, stamp, stamp),
+        )
+        batch_id = int(cursor.lastrowid)
+    task_ids = []
+    try:
+        for account in member_rows:
+            if not account["publishable"]:
+                with connect() as conn:
+                    conn.execute(
+                        """INSERT INTO publish_group_batch_items(
+                           batch_id,task_id,account_id,group_id,group_batch_id,
+                           account_name_snapshot,platform_name_snapshot,platform_code_snapshot,
+                           status,blocked_reason,error_code,created_at,updated_at)
+                           VALUES(?,NULL,?,?,?,?,?,?, 'skipped',?,?,?,?)""",
+                        (batch_id, account["account_id"], group_id, batch_id,
+                         account["account_name"], account["platform_name"], account["platform_code"],
+                         account["blocked_reason"], account["error_code"], stamp, stamp),
+                    )
+                continue
+            payload = dict(data)
+            payload["account_ids"] = [int(account["account_id"])]
+            payload["group_id"] = group_id
+            payload["group_batch_id"] = batch_id
+            task_id = create_publish_task(payload)
+            task_ids.append(task_id)
+            with connect() as conn:
+                conn.execute("UPDATE publish_tasks SET group_id=?,group_batch_id=? WHERE id=?", (group_id, batch_id, task_id))
+                task_state = conn.execute("SELECT status FROM publish_tasks WHERE id=?", (task_id,)).fetchone()["status"]
+                conn.execute(
+                    """INSERT INTO publish_group_batch_items(
+                       batch_id,task_id,account_id,group_id,group_batch_id,
+                       account_name_snapshot,platform_name_snapshot,platform_code_snapshot,
+                       status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (batch_id, task_id, account["account_id"], group_id, batch_id,
+                     account["account_name"], account["platform_name"], account["platform_code"],
+                     task_state, stamp, stamp),
+                )
+    except Exception:
+        with connect() as conn:
+            conn.execute("DELETE FROM publish_group_batches WHERE id=?", (batch_id,))
+            for task_id in task_ids:
+                conn.execute("DELETE FROM publish_tasks WHERE id=?", (task_id,))
+        raise
+    with connect() as conn:
+        conn.execute("UPDATE publish_account_groups SET last_used_at=?,updated_at=? WHERE id=?", (stamp, stamp, group_id))
+        recalculate_group_batch(conn, batch_id)
+    return _group_batch_result(batch_id)
+
+
+def create_group_publish_batch(data: dict) -> dict:
+    with GROUP_BATCH_LOCK:
+        return _create_group_publish_batch(data)
 
 def save_publishing_account(data: dict) -> int:
     platform_id = int(data.get("platform_id") or 0)
@@ -186,12 +601,9 @@ def save_publishing_account(data: dict) -> int:
         raise ValueError("平台不存在或已停用")
     stamp = now()
     integration_type = str(platform.get("integration_type") or "browser")
-    client_secret = str(data.get("oauth_client_secret") or "").strip()
-    api_config = {
-        "client_id": str(data.get("oauth_client_id") or "").strip(),
-        "client_secret_encrypted": protect(client_secret) if client_secret else "",
-        "redirect_uri": str(data.get("oauth_redirect_uri") or "").strip(),
-    } if integration_type == "api" else {}
+    # API developer credentials are provider-level configuration and are never
+    # accepted through ordinary account creation.
+    api_config = {}
     existing = row(
         "SELECT * FROM publish_accounts WHERE platform_id=? AND account_name=?",
         (platform_id, account_name),
@@ -200,15 +612,19 @@ def save_publishing_account(data: dict) -> int:
         raise ValueError("该平台下已存在同名账号")
     if existing:
         account_id = int(existing["id"])
-        path = profile_path(platform["code"], account_name, account_id) if integration_type == "browser" else ""
+        path = (
+            domestic_profile_path(platform["code"], account_id)
+            if integration_type == "browser" and platform["code"] in DOMESTIC_LOGIN_PLATFORMS
+            else profile_path(platform["code"], account_name, account_id) if integration_type == "browser" else ""
+        )
         if path:
             ensure_profile(path)
         with connect() as conn:
             conn.execute(
                 """UPDATE publish_accounts SET status='active',login_status='not_logged_in',
-                   browser_profile_path=?,publishing_mode=?,api_config_json=?,authorization_status='not_authorized',
-                   last_checked_at='',last_error='',updated_at=? WHERE id=?""",
-                (str(path), integration_type, json.dumps(api_config, ensure_ascii=False), stamp, account_id),
+                    browser_profile_path=?,publishing_mode=?,authorization_status='not_authorized',
+                    last_checked_at='',last_error='',updated_at=? WHERE id=?""",
+                (str(path), integration_type, stamp, account_id),
             )
         return account_id
     try:
@@ -221,7 +637,11 @@ def save_publishing_account(data: dict) -> int:
                 (platform_id, account_name, integration_type, json.dumps(api_config, ensure_ascii=False), stamp, stamp),
             )
             account_id = int(cursor.lastrowid)
-            path = profile_path(platform["code"], account_name, account_id) if integration_type == "browser" else ""
+            path = (
+                domestic_profile_path(platform["code"], account_id)
+                if integration_type == "browser" and platform["code"] in DOMESTIC_LOGIN_PLATFORMS
+                else profile_path(platform["code"], account_name, account_id) if integration_type == "browser" else ""
+            )
             if path:
                 ensure_profile(path)
             conn.execute("UPDATE publish_accounts SET browser_profile_path=? WHERE id=?", (str(path), account_id))
@@ -240,27 +660,47 @@ def publishing_account_context(account_id: int) -> tuple[dict, dict]:
     return platform, account
 
 
-def start_account_login(account_id: int) -> dict:
+def start_account_login(account_id: int, login_mode: str = "qr") -> dict:
     platform, account = publishing_account_context(account_id)
     if platform.get("integration_type") == "api":
         return start_authorization(platform, account)
+    platform_code = str(platform.get("code") or "")
+    if platform_code in DOMESTIC_LOGIN_PLATFORMS:
+        result = launch_domestic_login(
+            account_id,
+            platform_code,
+            account["browser_profile_path"],
+            initial_login_status=str(account.get("login_status") or "not_logged_in"),
+        )
+        return {
+            **result,
+            "status": str(result.get("status") or "starting"),
+            "network_requirement": platform.get("network_requirement", ""),
+        }
     with connect() as conn:
         conn.execute(
             "UPDATE publish_accounts SET login_status='login_pending',last_error='',updated_at=? WHERE id=?",
             (now(), account_id),
-        )
+    )
     try:
-        adapter = get_adapter(platform.get("adapter_code") or platform["code"])
-        result = adapter.start_authorization(
-            account["browser_profile_path"], account_id=account_id,
-            cookie_domains_json=platform.get("cookie_domains_json") or "[]",
-            login_cookie_names_json=platform.get("login_cookie_names_json") or "[]",
-        )
+        if platform_code == "tiktok":
+            result = launch_tiktok_login(account_id, account["browser_profile_path"], login_mode)
+        else:
+            adapter = get_adapter(platform.get("adapter_code") or platform["code"])
+            result = adapter.start_authorization(
+                account["browser_profile_path"], account_id=account_id,
+                cookie_domains_json=platform.get("cookie_domains_json") or "[]",
+                login_cookie_names_json=platform.get("login_cookie_names_json") or "[]",
+            )
     except Exception as exc:
         with connect() as conn:
             conn.execute("UPDATE publish_accounts SET last_error=?,updated_at=? WHERE id=?", (str(exc)[:500], now(), account_id))
         raise
-    return {**result, "status": "login_pending", "network_requirement": platform.get("network_requirement", "")}
+    return {
+        **result,
+        "status": str(result.get("status") or "login_pending"),
+        "network_requirement": platform.get("network_requirement", ""),
+    }
 
 
 def check_account_login(account_id: int) -> dict:
@@ -296,7 +736,13 @@ def check_account_login(account_id: int) -> dict:
         message = "OAuth 授权有效" if result["status"] == "authorized" else "尚未完成 OAuth 授权"
         return {**result, "message": message, "last_checked_at": stamp}
     try:
-        result = detect_login_status(platform, account)
+        platform_code = str(platform.get("code") or "")
+        if platform_code == "tiktok":
+            result = probe_tiktok_login(account_id, account["browser_profile_path"])
+        elif platform_code in DOMESTIC_LOGIN_PLATFORMS:
+            result = probe_domestic_login(account_id, platform_code, account["browser_profile_path"])
+        else:
+            result = detect_login_status(platform, account)
     except Exception as exc:
         with connect() as conn:
             conn.execute("UPDATE publish_accounts SET login_status='check_failed',last_checked_at=?,last_error=?,updated_at=? WHERE id=?", (now(), str(exc)[:500], now(), account_id))
@@ -373,7 +819,7 @@ def generate_title_preview(data):
     font_dir = str(item.get("font_dir") or "").strip()
     if font_dir and Path(font_dir).is_dir():
         title_filter += f":fontsdir='{ffmpeg_filter_path(font_dir)}'"
-    ffmpeg = find_ffmpeg(merged.get("ffmpeg_path", ""))
+    ffmpeg = find_ffmpeg()
     proc = subprocess.run(
         [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=0xE4EAF4:s=1080x1920:d=1",
          "-vf", title_filter, "-frames:v", "1", "-q:v", "2", str(output_path)],
@@ -432,6 +878,7 @@ def bootstrap():
     for task in tasks:
         task["output_url"] = media_url(task.get("output_path", ""))
         task["output_exists"] = bool(task.get("output_path") and Path(task["output_path"]).is_file())
+        task["heartbeat_state"] = heartbeat_state(task.get("last_heartbeat_at", ""))
     batch_tasks = rows(
         """SELECT b.*,t.name template_name FROM batch_tasks b
         LEFT JOIN edit_templates t ON t.id=b.template_id ORDER BY b.id DESC"""
@@ -448,10 +895,11 @@ def bootstrap():
             batch["category_ids"] = json.loads(batch.get("category_ids_json") or "[]")
         except (TypeError, ValueError):
             batch["category_ids"] = []
-        current = next((i for i in batch_items if i["batch_id"] == batch["id"] and i["status"] == "running"), None)
-        done = int(batch.get("completed_count") or 0) + int(batch.get("failed_count") or 0)
-        partial = float(current.get("progress") or 0) / 100 if current else 0
-        batch["progress"] = round((done + partial) / max(1, int(batch.get("total_count") or 0)) * 100)
+        own_items = [i for i in batch_items if i["batch_id"] == batch["id"]]
+        batch["progress"] = round(
+            sum(float(i.get("progress") or 0) for i in own_items)
+            / max(1, int(batch.get("total_count") or len(own_items) or 1))
+        )
     bgms = rows("SELECT * FROM bgm_library ORDER BY created_at DESC,id DESC")
     transitions = rows("SELECT * FROM shot_transitions ORDER BY from_shot_id,to_shot_id")
     sound_effects = rows("SELECT * FROM sound_effect_library ORDER BY category,name,id")
@@ -472,6 +920,22 @@ def bootstrap():
            FROM publish_channels pc JOIN publish_accounts a ON a.id=pc.account_id
            JOIN platforms p ON p.id=pc.platform_id ORDER BY pc.publish_task_id DESC,pc.id"""
     )
+    publish_account_groups = publishing_account_groups()
+    publish_group_batches = rows("SELECT b.*,COALESCE(g.name,b.name) group_name FROM publish_group_batches b LEFT JOIN publish_account_groups g ON g.id=b.group_id ORDER BY b.id DESC LIMIT 100")
+    publish_group_batch_items = rows(
+        """SELECT i.*,
+                  COALESCE(NULLIF(i.account_name_snapshot,''),a.account_name,'已删除账号') account_name,
+                  COALESCE(NULLIF(i.platform_name_snapshot,''),p.name,'未知平台') platform_name,
+                  COALESCE(NULLIF(i.platform_code_snapshot,''),p.code,'') platform_code
+           FROM publish_group_batch_items i
+           LEFT JOIN publish_accounts a ON a.id=i.account_id
+           LEFT JOIN platforms p ON p.id=a.platform_id
+           ORDER BY i.batch_id DESC,i.id"""
+    )
+    attach_and_schedule(
+        tasks,
+        {int(item["generation_task_id"]) for item in publish_tasks if item.get("generation_task_id")},
+    )
     for task in publish_tasks:
         try:
             task["tags"] = json.loads(task.get("tags_json") or "[]")
@@ -491,18 +955,22 @@ def bootstrap():
             "ai_services": ai_services, "tts_services": tts_services, "tts_voices": tts_voices,
             "platforms": platforms, "publish_accounts": publish_accounts,
             "publish_tasks": publish_tasks, "publish_channels": publish_channels,
+            "publish_account_groups": publish_account_groups, "publish_group_batches": publish_group_batches,
+            "publish_group_batch_items": publish_group_batch_items,
             "platform_test_runs": platform_test_runs, "admin_mode": is_admin_mode(),
-            "settings": settings(), "db_path": str(DB_PATH)}
+            "media_runtime": get_media_runtime_status(),
+            "settings": public_settings(), "db_path": str(DB_PATH)}
 
 
 def dashboard_task_snapshot():
     """Small task-only payload used by the workbench's 3-second refresh."""
     summary = row(
         """SELECT
-        SUM(CASE WHEN status IN ('running','processing_shot','merging') THEN 1 ELSE 0 END) running_count,
-        SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) queued_count,
-        SUM(CASE WHEN status='completed' AND substr(updated_at,1,10)=date('now','localtime') THEN 1 ELSE 0 END) today_completed_count,
-        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed_count
+        SUM(CASE WHEN status IN ('preparing','rendering','verifying') THEN 1 ELSE 0 END) running_count,
+        SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END) queued_count,
+        SUM(CASE WHEN status='succeeded' AND substr(updated_at,1,10)=date('now','localtime') THEN 1 ELSE 0 END) today_completed_count,
+        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed_count,
+        SUM(CASE WHEN status IN ('stalled','needs_manual_action','interrupted') THEN 1 ELSE 0 END) needs_action_count
         FROM generation_tasks"""
     ) or {}
     active = rows(
@@ -511,20 +979,630 @@ def dashboard_task_snapshot():
         FROM generation_tasks g
         LEFT JOIN edit_templates t ON t.id=g.template_id
         LEFT JOIN edit_templates src ON src.id=t.source_template_id
-        WHERE g.status IN ('pending','running','processing_shot','merging')
-        ORDER BY CASE WHEN g.status IN ('running','processing_shot','merging') THEN 0 ELSE 1 END,
+        WHERE g.status IN ('queued','preparing','rendering','verifying','stalled','needs_manual_action','interrupted')
+        ORDER BY CASE WHEN g.status IN ('stalled','needs_manual_action','interrupted') THEN 0
+                      WHEN g.status IN ('preparing','rendering','verifying') THEN 1 ELSE 2 END,
                  g.updated_at DESC,g.id DESC LIMIT 12"""
     )
-    current = next((item for item in active if item["status"] != "pending"), None)
-    queued = [item for item in active if item["status"] == "pending"][:2]
+    current = next((item for item in active if item["status"] in {"preparing", "rendering", "verifying"}), None)
+    queued = [item for item in active if item["status"] == "queued"][:2]
     return {
         "running_count": int(summary.get("running_count") or 0),
         "queued_count": int(summary.get("queued_count") or 0),
         "today_completed_count": int(summary.get("today_completed_count") or 0),
         "failed_count": int(summary.get("failed_count") or 0),
+        "needs_action_count": int(summary.get("needs_action_count") or 0),
         "current": current,
         "queued": queued,
     }
+
+
+def _task_center_union_sql() -> str:
+    """Return authoritative batch rows without eagerly loading child details."""
+    return """
+        SELECT 'batch' record_type,b.id record_id,b.template_id,
+               COALESCE(NULLIF(b.name,''),COALESCE(src.name,t.name,'\u672a\u547d\u540d\u9879\u76ee') || ' \u00b7 \u6279\u91cf\u751f\u6210' || b.total_count || '\u6761') display_name,
+               COALESCE(src.name,t.name,'\u672a\u547d\u540d\u9879\u76ee') project_name,
+               b.total_count,
+               COALESCE((SELECT SUM(CASE WHEN bi.status='succeeded' THEN 1 ELSE 0 END)
+                         FROM batch_task_items bi WHERE bi.batch_id=b.id),0) completed_count,
+               COALESCE((SELECT SUM(CASE WHEN bi.status='failed' THEN 1 ELSE 0 END)
+                         FROM batch_task_items bi WHERE bi.batch_id=b.id),0) failed_count,
+               COALESCE((SELECT SUM(CASE WHEN bi.status='queued' THEN 1 ELSE 0 END)
+                         FROM batch_task_items bi WHERE bi.batch_id=b.id),0) queued_count,
+               COALESCE((SELECT SUM(CASE WHEN bi.status IN ('preparing','rendering','verifying') THEN 1 ELSE 0 END)
+                         FROM batch_task_items bi WHERE bi.batch_id=b.id),0) running_count,
+               COALESCE((SELECT SUM(CASE WHEN bi.status IN ('stalled','paused') THEN 1 ELSE 0 END)
+                         FROM batch_task_items bi WHERE bi.batch_id=b.id),0) needs_action_count,
+               b.status,b.created_at,b.updated_at,b.finished_at,
+               COALESCE((SELECT ROUND(AVG(CASE WHEN g.status IN ('succeeded','completed') THEN 100 ELSE COALESCE(g.progress,0) END),0)
+                         FROM batch_task_items bi JOIN generation_tasks g ON g.id=bi.task_id
+                         WHERE bi.batch_id=b.id),0) progress_percent
+        FROM batch_tasks b
+        LEFT JOIN edit_templates t ON t.id=b.template_id
+        LEFT JOIN edit_templates src ON src.id=t.source_template_id
+        UNION ALL
+        SELECT 'single' record_type,g.id record_id,g.template_id,g.task_name display_name,
+               COALESCE(src.name,t.name,g.task_name,'\u672a\u547d\u540d\u9879\u76ee') project_name,
+               1 total_count,CASE WHEN g.status IN ('succeeded','completed') THEN 1 ELSE 0 END completed_count,
+               CASE WHEN g.status='failed' THEN 1 ELSE 0 END failed_count,
+               CASE WHEN g.status IN ('queued','pending') THEN 1 ELSE 0 END queued_count,
+               CASE WHEN g.status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 1 ELSE 0 END running_count,
+               CASE WHEN g.status IN ('stalled','paused','needs_manual_action','interrupted') THEN 1 ELSE 0 END needs_action_count,
+               g.status,g.created_at,g.updated_at,
+               CASE WHEN g.status IN ('succeeded','completed') THEN g.updated_at ELSE g.finished_at END finished_at,
+               CASE WHEN g.status IN ('succeeded','completed') THEN 100 ELSE COALESCE(g.progress,0) END progress_percent
+        FROM generation_tasks g
+        LEFT JOIN edit_templates t ON t.id=g.template_id
+        LEFT JOIN edit_templates src ON src.id=t.source_template_id
+        WHERE NOT EXISTS(SELECT 1 FROM batch_task_items bi WHERE bi.task_id=g.id)
+          AND NOT EXISTS(
+              SELECT 1 FROM generation_tasks newer
+              JOIN batch_task_items current_item ON current_item.task_id=newer.id
+              WHERE newer.retry_of_task_id=g.id
+          )
+    """
+
+
+def task_center_list(view: str = "current", page: int = 1, page_size: int = TASK_CENTER_PAGE_SIZE,
+                     status: str = "", project_id: int = 0, date_from: str = "", date_to: str = "",
+                     keyword: str = "") -> dict:
+    view = view if view in {"current", "recent", "history"} else "current"
+    page = max(1, int(page or 1))
+    page_size = max(1, min(100, int(page_size or TASK_CENTER_PAGE_SIZE)))
+    filters, args = [], []
+    active_marks = ",".join("?" for _ in TASK_CENTER_ACTIVE_STATUSES)
+    if view == "current":
+        filters.append(f"status IN ({active_marks})")
+        args.extend(sorted(TASK_CENTER_ACTIVE_STATUSES))
+    elif view == "recent":
+        filters.extend(["status IN ('succeeded','partially_succeeded','completed')", "datetime(COALESCE(NULLIF(finished_at,''),updated_at)) >= datetime('now','localtime','-7 days')"])
+    if project_id:
+        filters.append("template_id=?")
+        args.append(project_id)
+    if status:
+        filters.append("status=?")
+        args.append(status)
+    if date_from:
+        filters.append("date(created_at)>=date(?)")
+        args.append(date_from)
+    if date_to:
+        filters.append("date(created_at)<=date(?)")
+        args.append(date_to)
+    if keyword:
+        filters.append("(display_name LIKE ? OR project_name LIKE ?)")
+        value = f"%{keyword.strip()}%"
+        args.extend([value, value])
+    where = (" WHERE " + " AND ".join(filters)) if filters else ""
+    base = f"SELECT * FROM ({_task_center_union_sql()}) task_center{where}"
+    if view == "current":
+        ordering = " ORDER BY CASE WHEN status IN ('needs_action','failed','stalled','needs_manual_action','interrupted') THEN 0 WHEN status IN ('running','preparing','rendering','verifying','partially_blocked') THEN 1 WHEN status IN ('queued','pending') THEN 2 WHEN status='paused' THEN 3 ELSE 4 END,datetime(created_at) DESC,record_id DESC"
+    else:
+        ordering = " ORDER BY datetime(COALESCE(NULLIF(finished_at,''),updated_at)) DESC,record_id DESC"
+    with connect() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) count FROM ({base})", args).fetchone()["count"])
+        if view == "recent":
+            limit, offset = RECENT_COMPLETED_LIMIT, 0
+        else:
+            limit, offset = page_size, (page - 1) * page_size
+        result_rows = [dict(item) for item in conn.execute(base + ordering + " LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()]
+        summary_row = conn.execute(
+            """SELECT
+               SUM(CASE WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 1 ELSE 0 END) running_count,
+               SUM(CASE WHEN status IN ('queued','pending') THEN 1 ELSE 0 END) queued_count,
+               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed_count,
+               SUM(CASE WHEN status IN ('stalled','paused','needs_manual_action','interrupted') THEN 1 ELSE 0 END) needs_action_count
+               FROM generation_tasks g
+               WHERE EXISTS(SELECT 1 FROM batch_task_items current_item WHERE current_item.task_id=g.id)
+                  OR (
+                    NOT EXISTS(SELECT 1 FROM batch_task_items any_item WHERE any_item.task_id=g.id)
+                    AND NOT EXISTS(
+                      SELECT 1 FROM generation_tasks newer
+                      JOIN batch_task_items newer_item ON newer_item.task_id=newer.id
+                      WHERE newer.retry_of_task_id=g.id
+                    )
+                  )"""
+        ).fetchone()
+    return {
+        "view": view, "items": result_rows, "page": page, "page_size": limit,
+        "total": total, "total_pages": max(1, (total + page_size - 1) // page_size),
+        "recent_limit": RECENT_COMPLETED_LIMIT,
+        "summary": {key: int(summary_row[key] or 0) for key in ("running_count", "queued_count", "failed_count", "needs_action_count")},
+    }
+
+
+def task_center_items(record_type: str, record_id: int) -> list[dict]:
+    if record_type not in {"batch", "single"}:
+        raise ValueError("任务批次类型无效")
+    condition = "bi.batch_id=?" if record_type == "batch" else "g.id=?"
+    join = "JOIN batch_task_items bi ON bi.task_id=g.id" if record_type == "batch" else "LEFT JOIN batch_task_items bi ON bi.task_id=g.id"
+    items = rows(
+        f"""SELECT g.*,bi.batch_id,bi.index_no,COALESCE(src.name,t.name,g.task_name) template_name,
+                    COALESCE((SELECT SUM(s.voice_duration) FROM template_shots s WHERE s.template_id=g.template_id),0) output_duration
+             FROM generation_tasks g {join}
+             LEFT JOIN edit_templates t ON t.id=g.template_id
+             LEFT JOIN edit_templates src ON src.id=t.source_template_id
+             WHERE {condition} ORDER BY COALESCE(bi.index_no,1),g.id""", (record_id,)
+    )
+    for item in items:
+        item["status"] = canonical_task_status(item.get("status"))
+        item["output_url"] = media_url(item.get("output_path", ""))
+        item["output_exists"] = bool(item.get("output_path") and Path(item["output_path"]).is_file())
+        item["heartbeat_state"] = heartbeat_state(item.get("last_heartbeat_at", ""))
+        item.update(task_health_snapshot(int(item["id"])))
+    return items
+
+
+def _flat_task_base_sql() -> str:
+    return """
+        SELECT g.id,g.template_id,g.task_name,g.status,g.progress,g.output_path,g.error_message,
+               g.created_at,g.updated_at,g.started_at,g.last_heartbeat_at,g.current_stage,
+               g.current_step,g.finished_at,g.failed_stage,g.error_code,
+               bi.batch_id,bi.index_no,b.name batch_name,b.total_count batch_total,
+               b.status batch_status,COALESCE(src.id,t.id,g.template_id) project_id,
+               COALESCE(src.name,t.name,g.task_name,'未命名项目') project_name
+        FROM generation_tasks g
+        LEFT JOIN batch_task_items bi ON bi.task_id=g.id
+        LEFT JOIN batch_tasks b ON b.id=bi.batch_id
+        LEFT JOIN edit_templates t ON t.id=g.template_id
+        LEFT JOIN edit_templates src ON src.id=t.source_template_id
+        WHERE NOT EXISTS(SELECT 1 FROM generation_tasks newer WHERE newer.retry_of_task_id=g.id)
+    """
+
+
+def task_center_flat_list(view: str = "current", page: int = 1, page_size: int = 20,
+                          status: str = "", project_id: int = 0, batch_id: int = 0,
+                          date_from: str = "", date_to: str = "", keyword: str = "",
+                          focus_task_id: int = 0) -> dict:
+    """Return one real MP4 generation job per row; batches are metadata only."""
+    view = view if view in {"current", "recent", "history"} else "current"
+    page, page_size = max(1, int(page or 1)), max(1, min(100, int(page_size or 20)))
+    filters, args = [], []
+    if view == "current":
+        filters.append("status IN ('queued','pending','preparing','rendering','verifying','running','processing','processing_shot','merging','failed','stalled','paused','needs_action','needs_manual_action','interrupted')")
+    elif view == "recent":
+        filters.append("status IN ('succeeded','completed')")
+    if status:
+        aliases = {
+            "running": ("preparing", "rendering", "verifying", "running", "processing", "processing_shot", "merging"),
+            "queued": ("queued", "pending"), "needs_action": ("stalled", "paused", "needs_action", "needs_manual_action", "interrupted"),
+            "succeeded": ("succeeded", "completed"),
+        }
+        values = aliases.get(status, (status,))
+        marks = ",".join("?" for _ in values)
+        filters.append(f"status IN ({marks})")
+        args.extend(values)
+    if project_id:
+        filters.append("project_id=?")
+        args.append(int(project_id))
+    if batch_id:
+        filters.append("batch_id=?")
+        args.append(int(batch_id))
+    if date_from:
+        filters.append("date(created_at)>=date(?)")
+        args.append(date_from)
+    if date_to:
+        filters.append("date(created_at)<=date(?)")
+        args.append(date_to)
+    if keyword:
+        value = f"%{keyword.strip()}%"
+        filters.append("(task_name LIKE ? OR project_name LIKE ? OR COALESCE(batch_name,'') LIKE ?)")
+        args.extend((value, value, value))
+    base = f"SELECT * FROM ({_flat_task_base_sql()}) flat_tasks"
+    if filters:
+        base += " WHERE " + " AND ".join(filters)
+    focus_order = "CASE WHEN id=? THEN -1 ELSE 0 END," if focus_task_id else ""
+    order = f""" ORDER BY {focus_order}
+        CASE WHEN status IN ('stalled','paused','needs_action','needs_manual_action','interrupted') THEN 0
+             WHEN status='failed' THEN 1
+             WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 2
+             WHEN status IN ('queued','pending') THEN 3
+             WHEN status IN ('succeeded','completed') THEN 4 ELSE 5 END,
+        CASE WHEN batch_id IS NULL THEN created_at ELSE COALESCE((SELECT created_at FROM batch_tasks bx WHERE bx.id=batch_id),created_at) END,
+        COALESCE(batch_id,999999999),COALESCE(index_no,1),id"""
+    if view in {"recent", "history"}:
+        order = f" ORDER BY {focus_order} datetime(COALESCE(NULLIF(finished_at,''),updated_at)) DESC,id DESC"
+    order_args = (int(focus_task_id),) if focus_task_id else ()
+    with connect() as conn:
+        total = int(conn.execute(f"SELECT COUNT(*) count FROM ({base})", args).fetchone()["count"])
+        summary_row = conn.execute(
+            f"""SELECT
+                SUM(CASE WHEN status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging') THEN 1 ELSE 0 END) running_count,
+                SUM(CASE WHEN status IN ('queued','pending') THEN 1 ELSE 0 END) queued_count,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed_count,
+                SUM(CASE WHEN status IN ('stalled','paused','needs_action','needs_manual_action','interrupted') THEN 1 ELSE 0 END) needs_action_count
+                FROM ({base})""",
+            args,
+        ).fetchone()
+        limit = RECENT_COMPLETED_LIMIT if view == "recent" else page_size
+        offset = 0 if view == "recent" else (page - 1) * page_size
+        result = [dict(item) for item in conn.execute(
+            base + order + " LIMIT ? OFFSET ?", (*args, *order_args, limit, offset)
+        ).fetchall()]
+    queue = get_generation_queue_status()
+    blocking_id = int((queue.get("blocking_task") or {}).get("id") or 0)
+    running_id = int((queue.get("running_task") or {}).get("id") or 0)
+    next_id = int((queue.get("next_task") or {}).get("id") or 0)
+    queue_positions = {
+        int(item["id"]): index
+        for index, item in enumerate(queue.get("queued_tasks") or [], start=1)
+    }
+    for item in result:
+        item["status"] = canonical_task_status(item.get("status"))
+        item["error_summary"] = str(item.get("error_message") or "")
+        item["is_blocking"] = int(item["id"]) == blocking_id
+        item["is_running"] = int(item["id"]) == running_id
+        item["is_next"] = int(item["id"]) == next_id
+        item["output_exists"] = bool(item.get("output_path") and Path(str(item["output_path"])).is_file())
+        item["output_url"] = media_url(str(item.get("output_path") or ""))
+        if item["status"] == "queued":
+            item["queue_position"] = queue_positions.get(int(item["id"]), 0)
+            item["display_step"] = (
+                f"队列第 {item['queue_position']} 位 · 等待前一条完成"
+                if item["queue_position"] else "等待生成队列"
+            )
+        else:
+            item["display_step"] = item.get("current_step") or item.get("current_shot") or item.get("current_stage") or "—"
+    return {
+        "view": view, "items": result, "page": page, "page_size": limit, "total": total,
+        "total_pages": max(1, (total + page_size - 1) // page_size), "queue": queue,
+        "summary": {
+            key: int(summary_row[key] or 0)
+            for key in ("running_count", "queued_count", "failed_count", "needs_action_count")
+        },
+    }
+
+
+def _queue_task_row(record) -> dict | None:
+    if not record:
+        return None
+    item = dict(record)
+    item["status"] = canonical_task_status(item.get("status"))
+    item["error_summary"] = str(item.get("error_message") or "")
+    return item
+
+
+def get_generation_queue_status() -> dict:
+    """Describe the single global generation slot and the task blocking it."""
+    runtime = generation_worker_snapshot()
+    active_marks = ",".join("?" for _ in ACTIVE_TASK_STATUSES)
+    with connect() as conn:
+        queue_order = (
+            "CASE WHEN COALESCE(g.queue_seq,0)>0 THEN g.queue_seq ELSE g.id END,g.id"
+            if generation_queue_seq_supported(conn) else "g.id"
+        )
+        running = conn.execute(
+            f"""SELECT g.id,g.task_name,g.status,g.progress,g.current_step,g.current_stage,g.created_at,
+                       bi.batch_id,bi.index_no,b.name batch_name,b.total_count batch_total,g.error_message
+                FROM generation_tasks g LEFT JOIN batch_task_items bi ON bi.task_id=g.id
+                LEFT JOIN batch_tasks b ON b.id=bi.batch_id
+                WHERE g.status IN ({active_marks})
+                ORDER BY {queue_order} LIMIT 1""",
+            tuple(sorted(ACTIVE_TASK_STATUSES))
+        ).fetchone()
+        queued_count = int(conn.execute(
+            "SELECT COUNT(*) count FROM generation_tasks WHERE status IN ('queued','pending')"
+        ).fetchone()["count"])
+        queued_tasks = conn.execute(
+            f"""SELECT g.id,g.task_name,g.status,g.progress,g.current_step,g.current_stage,g.created_at,
+                      bi.batch_id,bi.index_no,b.name batch_name,b.total_count batch_total,g.error_message
+               FROM generation_tasks g LEFT JOIN batch_task_items bi ON bi.task_id=g.id
+               LEFT JOIN batch_tasks b ON b.id=bi.batch_id
+               WHERE g.status IN ('queued','pending')
+               ORDER BY {queue_order}"""
+        ).fetchall()
+        blocking = conn.execute(
+            """SELECT g.id,g.task_name,g.status,g.progress,g.current_step,g.current_stage,g.created_at,
+                      bi.batch_id,bi.index_no,b.name batch_name,b.total_count batch_total,g.error_message,g.error_code
+               FROM generation_tasks g JOIN batch_task_items bi ON bi.task_id=g.id
+               JOIN batch_tasks b ON b.id=bi.batch_id
+               WHERE b.status IN ('needs_action','partially_blocked')
+                 AND g.status IN ('failed','stalled','paused','needs_action','needs_manual_action','interrupted')
+                 AND EXISTS(SELECT 1 FROM batch_task_items later JOIN generation_tasks q ON q.id=later.task_id
+                            WHERE later.batch_id=bi.batch_id AND later.index_no>bi.index_no AND q.status IN ('queued','pending'))
+               ORDER BY b.created_at,b.id,bi.index_no LIMIT 1"""
+        ).fetchone()
+    running_item = _queue_task_row(running)
+    queued_items = [_queue_task_row(item) for item in queued_tasks]
+    next_item = queued_items[0] if queued_items else None
+    blocking_item = _queue_task_row(blocking)
+    reason = ""
+    if blocking_item:
+        reason = blocking_item.get("error_summary") or "前一条任务失败，需要处理后才能继续"
+    elif queued_count and not running_item:
+        reason = "当前存在排队任务，但生成Worker没有运行"
+    state = "running" if running_item else "blocked" if blocking_item else "waiting" if queued_count else "idle"
+    return {
+        "state": state, "running_task": running_item, "next_task": next_item,
+        "queued_count": queued_count, "blocking_task": blocking_item,
+        "queued_tasks": queued_items,
+        "blocking_reason": reason, "worker_status": runtime,
+        "batch_worker_status": BATCH_QUEUE.snapshot(),
+        "max_concurrency": MAX_GENERATION_CONCURRENCY,
+    }
+
+
+def ensure_generation_worker_running() -> dict:
+    """Keep both queue coordinators alive; safe to call repeatedly."""
+    generation_restarted = GENERATION_QUEUE.ensure_started()
+    batch_restarted = BATCH_QUEUE.ensure_started()
+    GENERATION_QUEUE.signal()
+    BATCH_QUEUE.signal()
+    if generation_restarted or batch_restarted:
+        append_generation_worker_log(
+            "Watchdog restarted workers | generation="
+            f"{int(generation_restarted)} | batch={int(batch_restarted)}"
+        )
+    return {
+        "generation": GENERATION_QUEUE.snapshot(),
+        "batch": BATCH_QUEUE.snapshot(),
+    }
+
+
+def _wake_earliest_durable_task() -> int:
+    """Wake the owner of the oldest queued DB row without bypassing batch policy."""
+    with connect() as conn:
+        queue_seq_enabled = generation_queue_seq_supported(conn)
+        order_expr = (
+            "CASE WHEN COALESCE(queue_seq,0)>0 THEN queue_seq ELSE id END,id"
+            if queue_seq_enabled else "id"
+        )
+        joined_order_expr = (
+            "CASE WHEN COALESCE(g.queue_seq,0)>0 THEN g.queue_seq ELSE g.id END,g.id"
+            if queue_seq_enabled else "g.id"
+        )
+        active = conn.execute(
+            f"""SELECT id FROM generation_tasks
+               WHERE status IN ('preparing','rendering','verifying','running','processing','processing_shot','merging')
+               ORDER BY {order_expr} LIMIT 1"""
+        ).fetchone()
+        queued = conn.execute(
+            f"""SELECT g.id,i.batch_id
+               FROM generation_tasks g
+               LEFT JOIN batch_task_items i ON i.task_id=g.id
+               WHERE g.status IN ('queued','pending')
+               ORDER BY {joined_order_expr} LIMIT 1"""
+        ).fetchone()
+    if active or not queued:
+        return 0
+    task_id = int(queued["id"])
+    batch_id = int(queued["batch_id"] or 0)
+    if batch_id:
+        BATCH_QUEUE.enqueue(batch_id, start_batch_generation)
+    else:
+        start_generate(task_id)
+    append_generation_worker_log(
+        f"Watchdog wake durable task #{task_id}" + (f" | batch #{batch_id}" if batch_id else "")
+    )
+    return task_id
+
+
+def _generation_watchdog_loop() -> None:
+    append_generation_worker_log("Generation watchdog started")
+    while not _GENERATION_WATCHDOG_STOP.wait(GENERATION_WATCHDOG_INTERVAL_SECONDS):
+        try:
+            ensure_generation_worker_running()
+            _wake_earliest_durable_task()
+        except BaseException as exc:
+            append_generation_worker_log(
+                f"Watchdog error · {type(exc).__name__}: {exc}"
+            )
+    append_generation_worker_log("Generation watchdog stopped")
+
+
+def start_generation_watchdog() -> bool:
+    """Start one process-wide self-healing watchdog."""
+    global _GENERATION_WATCHDOG_THREAD
+    with _GENERATION_WATCHDOG_LOCK:
+        if _GENERATION_WATCHDOG_THREAD and _GENERATION_WATCHDOG_THREAD.is_alive():
+            return False
+        _GENERATION_WATCHDOG_STOP.clear()
+        _GENERATION_WATCHDOG_THREAD = threading.Thread(
+            target=_generation_watchdog_loop,
+            name="mixcut-generation-watchdog",
+            daemon=True,
+        )
+        _GENERATION_WATCHDOG_THREAD.start()
+    return True
+
+
+def scan_invalid_generation_tasks(apply: bool = False) -> dict:
+    """Audit stale runtime state without deleting output files or user records."""
+    findings = []
+    with connect() as conn:
+        candidates = conn.execute(
+            """SELECT id,task_name,status,template_id,last_heartbeat_at,worker_id,process_id,
+                      ffmpeg_pid,ffprobe_pid,output_path FROM generation_tasks
+               WHERE status IN ('running','processing','processing_shot','merging','preparing','rendering','verifying','queued','pending','cancelled','succeeded','completed')"""
+        ).fetchall()
+        for record in candidates:
+            status = canonical_task_status(record["status"])
+            health = task_health_snapshot(int(record["id"]))
+            if status in {"preparing", "rendering", "verifying"}:
+                age = health.get("heartbeat_age_seconds")
+                if age is not None and age > 180 and not any(health.get(key) for key in ("worker_alive", "process_alive", "ffmpeg_alive", "ffprobe_alive")):
+                    findings.append({"task_id": int(record["id"]), "type": "worker_missing", "message": "任务已超过180秒没有心跳，且Worker与FFmpeg均不存在", "fix": "stalled"})
+            if status == "queued" and record["template_id"] and not conn.execute("SELECT 1 FROM edit_templates WHERE id=?", (int(record["template_id"]),)).fetchone():
+                findings.append({"task_id": int(record["id"]), "type": "project_missing", "message": "排队任务引用的项目已经不存在", "fix": "cancelled"})
+            if status == "succeeded" and record["output_path"] and not Path(str(record["output_path"])).is_file():
+                findings.append({"task_id": int(record["id"]), "type": "output_missing", "message": "成片记录存在，但输出文件已经不存在", "fix": "keep_record"})
+        batches = conn.execute(
+            """SELECT b.id,b.name,b.total_count,b.status,COUNT(i.id) item_count
+               FROM batch_tasks b LEFT JOIN batch_task_items i ON i.batch_id=b.id
+               WHERE b.status IN ('queued','running','needs_action','partially_blocked')
+               GROUP BY b.id HAVING COUNT(i.id)=0 OR COUNT(i.id)<>b.total_count"""
+        ).fetchall()
+        for batch in batches:
+            expected = int(batch["total_count"] or 0)
+            actual = int(batch["item_count"] or 0)
+            message = (
+                f"批次应有{expected}条任务，当前只有{actual}条"
+                if expected else "历史批次只有父记录，没有任何视频子任务"
+            )
+            findings.append({"batch_id": int(batch["id"]), "type": "batch_item_missing", "message": message, "fix": "needs_action"})
+        fixed = 0
+        if apply:
+            for item in findings:
+                if item.get("task_id") and item["fix"] == "stalled":
+                    conn.execute(
+                        """UPDATE generation_tasks SET status='stalled',current_stage='stalled',current_step='任务已失去生成Worker',
+                           current_shot='任务已失去生成Worker',worker_id='',process_id=0,process_name='',ffmpeg_pid=0,ffprobe_pid=0,
+                           error_code='WORKER_STALLED',error_message=?,updated_at=? WHERE id=?""",
+                        (item["message"], now(), int(item["task_id"])),
+                    ); fixed += 1
+                elif item.get("task_id") and item["fix"] == "cancelled":
+                    conn.execute(
+                        "UPDATE generation_tasks SET status='cancelled',current_stage='cancelled',current_step='项目已不存在',error_code='PROJECT_MISSING',error_message=?,updated_at=? WHERE id=?",
+                        (item["message"], now(), int(item["task_id"])),
+                    ); fixed += 1
+                elif item.get("batch_id") and item["fix"] == "needs_action":
+                    conn.execute("UPDATE batch_tasks SET status='needs_action',updated_at=? WHERE id=?", (now(), int(item["batch_id"]))); fixed += 1
+            valid_batches = [int(r["id"]) for r in conn.execute(
+                "SELECT b.id FROM batch_tasks b WHERE (SELECT COUNT(*) FROM batch_task_items i WHERE i.batch_id=b.id)=b.total_count"
+            ).fetchall()]
+        else:
+            fixed, valid_batches = 0, []
+    if apply:
+        for batch_id_value in valid_batches:
+            sync_batch(batch_id_value)
+    summary = {}
+    for item in findings:
+        summary[item["type"]] = summary.get(item["type"], 0) + 1
+    return {"count": len(findings), "fixed": fixed, "summary": summary, "items": findings}
+
+
+def repair_generation_queue() -> dict:
+    audit = scan_invalid_generation_tasks(apply=True)
+    queue = get_generation_queue_status()
+    if queue.get("running_task"):
+        return {"repaired": True, "started": False, "message": "当前生成任务运行正常", "audit": audit, "queue": queue}
+    if queue.get("blocking_task"):
+        return {"repaired": False, "started": False, "message": "队列仍被失败任务阻塞，请重试、跳过或删除并继续", "audit": audit, "queue": queue}
+    next_task = queue.get("next_task")
+    if not next_task:
+        return {"repaired": True, "started": False, "message": "当前没有等待生成的任务", "audit": audit, "queue": queue}
+    batch_id_value = int(next_task.get("batch_id") or 0)
+    if batch_id_value:
+        BATCH_QUEUE.enqueue(batch_id_value, start_batch_generation)
+    else:
+        start_generate(int(next_task["id"]))
+    return {"repaired": True, "started": True, "task_id": int(next_task["id"]), "message": "已恢复队列，并只启动第一条任务", "audit": audit, "queue": get_generation_queue_status()}
+
+
+def delete_generation_task_records(task_ids: list[int], delete_outputs: bool = False) -> dict:
+    deleted, skipped = [], []
+    with connect() as conn:
+        affected_batches = set()
+        for task_id in sorted({int(value) for value in task_ids if int(value) > 0}):
+            task = conn.execute("SELECT status,output_path FROM generation_tasks WHERE id=?", (task_id,)).fetchone()
+            if not task:
+                continue
+            status = canonical_task_status(task["status"])
+            if status in {"preparing", "rendering", "verifying"}:
+                skipped.append({"task_id": task_id, "reason": "生成中的任务必须先停止"})
+                continue
+            batch = conn.execute("SELECT batch_id FROM batch_task_items WHERE task_id=?", (task_id,)).fetchone()
+            if batch:
+                affected_batches.add(int(batch["batch_id"]))
+            if delete_outputs and task["output_path"]:
+                path = Path(str(task["output_path"]))
+                if path.is_file():
+                    path.unlink()
+            conn.execute("DELETE FROM generation_shot_materials WHERE task_id=?", (task_id,))
+            conn.execute("DELETE FROM generation_tasks WHERE id=?", (task_id,))
+            deleted.append(task_id)
+        for batch_id_value in affected_batches:
+            count = int(conn.execute("SELECT COUNT(*) count FROM batch_task_items WHERE batch_id=?", (batch_id_value,)).fetchone()["count"])
+            conn.execute("UPDATE batch_tasks SET total_count=?,updated_at=? WHERE id=?", (count, now(), batch_id_value))
+    for batch_id_value in affected_batches:
+        sync_batch(batch_id_value)
+    return {"deleted": deleted, "skipped": skipped, "deleted_outputs": bool(delete_outputs)}
+
+
+def cleanup_generation_task_records(statuses: list[str], age: str = "all", delete_outputs: bool = False) -> dict:
+    allowed = {"succeeded", "completed", "failed", "cancelled", "stalled", "paused", "needs_action", "needs_manual_action", "interrupted"}
+    selected = [value for value in statuses if value in allowed]
+    if not selected:
+        raise ValueError("请选择需要清理的任务状态")
+    marks = ",".join("?" for _ in selected)
+    sql, args = f"SELECT id FROM generation_tasks WHERE status IN ({marks})", list(selected)
+    if age in {"7", "30"}:
+        sql += " AND datetime(updated_at)<datetime('now','localtime',?)"
+        args.append(f"-{int(age)} days")
+    task_ids = [int(item["id"]) for item in rows(sql, args)]
+    result = delete_generation_task_records(task_ids, delete_outputs)
+    result["matched"] = len(task_ids)
+    return result
+
+
+def delete_generation_task_and_continue(task_id: int) -> dict:
+    result = skip_generation_task_and_continue(int(task_id))
+    with connect() as conn:
+        conn.execute(
+            "UPDATE generation_tasks SET error_code='ARCHIVED_AND_CONTINUED',error_message='用户已删除此失败任务并继续队列',updated_at=? WHERE id=?",
+            (now(), int(task_id)),
+        )
+    append_task_log(int(task_id), "用户选择删除并继续；失败记录已归档，队列继续")
+    result["archived"] = True
+    return result
+
+
+def delete_task_center_records(records: list[dict], delete_outputs: bool = False) -> dict:
+    deleted = 0
+    with connect() as conn:
+        for record in records:
+            record_type, record_id = str(record.get("record_type") or ""), int(record.get("record_id") or 0)
+            if record_type == "batch":
+                batch_state = conn.execute("SELECT status FROM batch_tasks WHERE id=?", (record_id,)).fetchone()
+                if not batch_state: continue
+                if batch_state["status"] in TASK_CENTER_ACTIVE_STATUSES - {"failed", "completed_with_errors", "needs_action", "needs_manual_action", "paused"}:
+                    raise ValueError("运行中或排队中的批次不能删除")
+                task_rows = conn.execute("SELECT g.id,g.status,g.output_path FROM generation_tasks g JOIN batch_task_items bi ON bi.task_id=g.id WHERE bi.batch_id=?", (record_id,)).fetchall()
+                if any(item["status"] in TASK_CENTER_ACTIVE_STATUSES - {"failed", "needs_action", "paused"} for item in task_rows):
+                    raise ValueError("运行中或排队中的批次不能删除")
+                task_ids = [int(item["id"]) for item in task_rows]
+                if delete_outputs:
+                    for item in task_rows:
+                        path = Path(str(item["output_path"] or ""))
+                        if path.is_file(): path.unlink()
+                if task_ids:
+                    marks = ",".join("?" for _ in task_ids)
+                    conn.execute(f"DELETE FROM generation_shot_materials WHERE task_id IN ({marks})", task_ids)
+                    conn.execute(f"DELETE FROM generation_tasks WHERE id IN ({marks})", task_ids)
+                conn.execute("DELETE FROM batch_tasks WHERE id=?", (record_id,))
+                deleted += 1
+            elif record_type in {"single", "task"}:
+                task = conn.execute("SELECT status,output_path FROM generation_tasks WHERE id=?", (record_id,)).fetchone()
+                if not task: continue
+                batch = conn.execute("SELECT batch_id FROM batch_task_items WHERE task_id=?", (record_id,)).fetchone()
+                if task["status"] in TASK_CENTER_ACTIVE_STATUSES - {"failed", "needs_action", "paused"}:
+                    raise ValueError("运行中或排队中的任务不能删除")
+                if delete_outputs:
+                    path = Path(str(task["output_path"] or ""))
+                    if path.is_file(): path.unlink()
+                conn.execute("DELETE FROM generation_shot_materials WHERE task_id=?", (record_id,))
+                conn.execute("DELETE FROM generation_tasks WHERE id=?", (record_id,))
+                if batch:
+                    counts = conn.execute(
+                        """SELECT COUNT(*) total,
+                                  SUM(CASE WHEN g.status IN ('succeeded','completed') THEN 1 ELSE 0 END) completed,
+                                  SUM(CASE WHEN g.status='failed' THEN 1 ELSE 0 END) failed
+                           FROM batch_task_items bi JOIN generation_tasks g ON g.id=bi.task_id
+                           WHERE bi.batch_id=?""", (int(batch["batch_id"]),)
+                    ).fetchone()
+                    conn.execute(
+                        "UPDATE batch_tasks SET total_count=?,completed_count=?,failed_count=?,updated_at=? WHERE id=?",
+                        (int(counts["total"] or 0), int(counts["completed"] or 0), int(counts["failed"] or 0), now(), int(batch["batch_id"])),
+                    )
+                deleted += 1
+    return {"deleted": deleted, "deleted_outputs": bool(delete_outputs)}
+
+
+def delete_old_completed_records(delete_outputs: bool = False) -> dict:
+    cutoff = rows(f"SELECT record_type,record_id FROM ({_task_center_union_sql()}) WHERE status IN ('completed','succeeded','partially_succeeded') AND datetime(COALESCE(NULLIF(finished_at,''),updated_at)) < datetime('now','localtime','-30 days')")
+    result = delete_task_center_records(cutoff, delete_outputs)
+    result["matched"] = len(cutoff)
+    return result
 
 
 def dashboard_task_thumbnail(task_id: int) -> Path:
@@ -537,7 +1615,7 @@ def dashboard_task_thumbnail(task_id: int) -> Path:
     cached = THUMB_DIR / f"{digest[:16]}.jpg"
     if cached.is_file():
         return cached
-    return Path(make_thumbnail(source, digest, settings().get("ffmpeg_path", "")))
+    return Path(make_thumbnail(source, digest))
 
 
 def open_task_output(task_id: int):
@@ -547,6 +1625,69 @@ def open_task_output(task_id: int):
         raise FileNotFoundError("成片文件不存在")
     subprocess.Popen(["explorer.exe", "/select,", str(output)])
     return True
+
+
+def task_log_details(task_id: int) -> dict:
+    task = row(
+        """SELECT g.id,g.task_name,g.status,g.current_stage,g.failed_stage,g.current_step,g.current_item,g.current_shot,
+                    g.error_code,g.error_message,g.technical_log_id,g.log_path,g.diagnostic_log,g.progress,
+                    g.last_heartbeat_at,g.worker_id,g.process_id,g.process_name,g.ffmpeg_pid,g.ffprobe_pid,
+                   g.created_at,g.finished_at,g.updated_at,g.output_path,
+                   COALESCE((SELECT SUM(s.voice_duration) FROM template_shots s WHERE s.template_id=g.template_id),0) output_duration,
+                   bi.index_no,b.total_count,bi.batch_id
+           FROM generation_tasks g
+           LEFT JOIN batch_task_items bi ON bi.task_id=g.id
+           LEFT JOIN batch_tasks b ON b.id=bi.batch_id
+           WHERE g.id=?""", (int(task_id),)
+    )
+    if not task:
+        raise ValueError("任务不存在")
+    log_file = Path(str(task.get("log_path") or task_log_path(task_id)))
+    file_lines: list[str] = []
+    if log_file.is_file():
+        try:
+            file_lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-100:]
+        except OSError:
+            file_lines = []
+    if not file_lines:
+        file_lines = str(task.get("diagnostic_log") or "").splitlines()[-100:]
+    health = task_health_snapshot(int(task_id))
+    return {
+        "task_id": int(task_id), "task_name": task.get("task_name") or f"任务{task_id}",
+        "index_no": int(task.get("index_no") or 1), "total_count": int(task.get("total_count") or 1),
+        "status": canonical_task_status(task.get("status")), "current_stage": task.get("current_stage") or "",
+        "failed_stage": task.get("failed_stage") or task.get("current_stage") or "",
+        "progress": int(task.get("progress") or 0), "error_code": task.get("error_code") or "",
+        "error_summary": task.get("error_message") or "",
+        "technical_log_id": task.get("technical_log_id") or f"MIX-{int(task_id):06d}",
+        "last_heartbeat_at": task.get("last_heartbeat_at") or "",
+        "created_at": task.get("created_at") or "", "started_at": task.get("created_at") or "",
+        "finished_at": task.get("finished_at") or "", "updated_at": task.get("updated_at") or "",
+        "current_step": task.get("current_step") or task.get("current_shot") or "",
+        "current_shot": task.get("current_shot") or task.get("current_step") or "",
+        "output_path": task.get("output_path") or "", "output_duration": float(task.get("output_duration") or 0),
+        "output_exists": bool(task.get("output_path") and Path(str(task.get("output_path"))).is_file()),
+        "output_url": media_url(task.get("output_path") or ""),
+        "batch_id": int(task.get("batch_id") or 0),
+        "worker_id": task.get("worker_id") or "", "process_id": int(task.get("process_id") or 0),
+        "process_name": task.get("process_name") or "", "ffmpeg_pid": int(task.get("ffmpeg_pid") or 0),
+        "ffprobe_pid": int(task.get("ffprobe_pid") or 0), **health,
+        "log_exists": log_file.is_file(), "log_file_name": log_file.name,
+        "recent_logs": "\n".join(file_lines) or "该历史任务没有保存完整诊断日志。",
+    }
+
+
+def open_task_log(task_id: int) -> dict:
+    details = task_log_details(task_id)
+    if not details["log_exists"]:
+        raise FileNotFoundError("未找到该任务的日志文件。历史任务可能在日志功能启用前已经结束。")
+    task = row("SELECT log_path FROM generation_tasks WHERE id=?", (int(task_id),))
+    path = Path(str((task or {}).get("log_path") or ""))
+    if os.name == "nt":
+        os.startfile(str(path))
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+    return {"opened": True, "file_name": path.name}
 
 
 def select_folder() -> str:
@@ -604,16 +1745,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console
         payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         raise ValueError("Google OAuth JSON 无法读取或格式错误") from exc
-    config = payload.get("installed") or payload.get("web") or {}
-    client_id = str(config.get("client_id") or "").strip()
-    client_secret = str(config.get("client_secret") or "").strip()
-    if not client_id or not client_secret:
-        raise ValueError("OAuth JSON 中缺少 client_id 或 client_secret")
-    redirect_uris = config.get("redirect_uris") or []
-    redirect_uri = next((str(item) for item in redirect_uris if str(item).startswith("http://127.0.0.1")),
-                        "http://127.0.0.1:17866/api/oauth/callback")
-    return {"client_id": client_id, "client_secret": client_secret, "redirect_uri": redirect_uri,
-            "source_name": path.name}
+    return import_google_oauth_payload(payload, path.name)
 
 
 def select_voice_sample() -> str:
@@ -653,89 +1785,242 @@ def clone_tts_voice(service_id: int, data: dict):
     return result
 
 
-def scan_materials(folder: str):
-    root = Path(folder)
-    if not root.is_dir():
-        raise ValueError("素材目录不存在")
-    cfg = settings()
-    ffprobe = cfg.get("ffprobe_path", "")
-    ffmpeg = cfg.get("ffmpeg_path", "")
-    files = scan_video_files(folder)
-    folder_categories = [item.name for item in root.iterdir() if item.is_dir()]
-    if any(path.parent == root for path in files):
-        folder_categories.append("未分类")
-    # The first-level folders are the category source of truth.
-    with connect() as conn:
-        for order, category_name in enumerate(dict.fromkeys(folder_categories), 1):
+def material_root_status() -> dict:
+    configured = str(settings().get("material_root") or "").strip()
+    root = Path(configured) if configured else None
+    return {"folder": configured, "exists": bool(root and root.is_dir()), "scanning": MATERIAL_SCAN_LOCK.locked()}
+
+
+def open_material_root() -> dict:
+    state = material_root_status()
+    root = Path(state["folder"])
+    if not state["exists"]:
+        raise ValueError("当前素材目录不可用，请重新选择素材目录")
+    if os.name == "nt":
+        os.startfile(str(root))
+    else:
+        subprocess.Popen(["xdg-open", str(root)])
+    return {"opened": True, "folder": str(root)}
+
+
+def _path_key(value: str | Path) -> str:
+    try:
+        return os.path.normcase(str(Path(value).resolve()))
+    except OSError:
+        return os.path.normcase(os.path.abspath(str(value)))
+
+
+def _material_error_text(exc: Exception) -> str:
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "FFprobe处理超时"
+    if isinstance(exc, PermissionError):
+        return "文件正在被其他程序占用"
+    if isinstance(exc, FileNotFoundError):
+        return "素材文件不存在"
+    return "素材无法读取或视频格式异常"
+
+
+def scan_materials(folder: str = ""):
+    """Incrementally synchronize the configured material root with SQLite."""
+    configured = str(folder or settings().get("material_root") or "").strip()
+    root = Path(configured) if configured else None
+    if not root or not root.is_dir():
+        raise ValueError("当前素材目录不可用，请选择新的素材文件夹")
+    if not MATERIAL_SCAN_LOCK.acquire(blocking=False):
+        raise ValueError("素材正在扫描中")
+
+    scan_id = 0
+    root_resolved = root.resolve()
+    result = {
+        "total": 0, "added": 0, "updated": 0, "missing": 0,
+        "errors": 0, "unchanged": 0, "folder": str(root_resolved),
+        "scan_id": 0, "error_items": [],
+    }
+    try:
+        ffprobe = ""
+        ffmpeg = ""
+        files = sorted(scan_video_files(str(root_resolved)), key=lambda item: _path_key(item))
+        result["total"] = len(files)
+        disk_keys = {_path_key(path) for path in files}
+
+        folder_categories = [item.name for item in root_resolved.iterdir() if item.is_dir()]
+        if any(path.parent == root_resolved for path in files):
+            folder_categories.append("未分类")
+        with connect() as conn:
+            # A process-local lock is authoritative. Old running rows only mean the
+            # previous executable exited before it could close the audit record.
             conn.execute(
-                """INSERT INTO material_categories(name,description,sort_order,created_at,updated_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order,updated_at=excluded.updated_at""",
-                (category_name, "扫描目录自动创建", order, now(), now()),
+                "UPDATE scan_tasks SET status='interrupted',error_message='上次扫描被软件退出中断',finished_at=? WHERE status='running'",
+                (now(),),
             )
-    added = updated = 0
-    with connect() as conn:
-        conn.execute("INSERT INTO scan_tasks(folder_path,status,total_files,created_at) VALUES(?,?,?,?)",
-                     (folder, "running", len(files), now()))
-        scan_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    for index, path in enumerate(files, 1):
-        rel = path.relative_to(root)
-        category_name = rel.parts[0] if len(rel.parts) > 1 else "未分类"
-        with connect() as conn:
-            cat = conn.execute("SELECT id FROM material_categories WHERE name=?", (category_name,)).fetchone()
-            if not cat:
-                max_order = conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM material_categories").fetchone()[0]
-                conn.execute("INSERT INTO material_categories(name,description,sort_order,created_at,updated_at) VALUES(?,?,?,?,?)",
-                             (category_name, "扫描目录自动创建", max_order, now(), now()))
-                category_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            else:
-                category_id = cat[0]
-        digest = quick_hash(path)
-        info = probe_video(path, ffprobe)
-        thumb = make_thumbnail(path, digest, ffmpeg)
-        with connect() as conn:
-            exists = conn.execute("SELECT id FROM materials WHERE file_path=?", (str(path),)).fetchone()
-            if exists:
-                conn.execute("""UPDATE materials SET category_id=?,file_name=?,file_hash=?,duration=?,width=?,height=?,fps=?,size=?,thumbnail_path=?,status='active',updated_at=? WHERE id=?""",
-                             (category_id, path.name, digest, info["duration"], info["width"], info["height"], info["fps"], info["size"], thumb, now(), exists[0]))
-                updated += 1
-            else:
-                conn.execute("""INSERT INTO materials(category_id,file_path,file_name,file_hash,duration,width,height,fps,size,thumbnail_path,status,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,'active',?,?)""",
-                    (category_id, str(path), path.name, digest, info["duration"], info["width"], info["height"], info["fps"], info["size"], thumb, now(), now()))
-                added += 1
-            conn.execute("UPDATE scan_tasks SET scanned_files=?,added_count=? WHERE id=?", (index, added, scan_id))
-    with connect() as conn:
-        conn.execute("UPDATE scan_tasks SET status='completed',finished_at=?,skipped_count=? WHERE id=?", (now(), updated, scan_id))
-        allowed_names = list(dict.fromkeys(folder_categories))
-        root_resolved = root.resolve()
-        outside_ids = []
-        for material in conn.execute("SELECT id,file_path FROM materials").fetchall():
+            for order, category_name in enumerate(dict.fromkeys(folder_categories), 1):
+                conn.execute(
+                    """INSERT INTO material_categories(name,description,sort_order,created_at,updated_at)
+                       VALUES(?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order,updated_at=excluded.updated_at""",
+                    (category_name, "扫描目录自动创建", order, now(), now()),
+                )
+            conn.execute(
+                """INSERT INTO scan_tasks(folder_path,status,total_files,created_at)
+                   VALUES(?,?,?,?)""", (str(root_resolved), "running", len(files), now())
+            )
+            scan_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            result["scan_id"] = scan_id
+            conn.execute(
+                """INSERT INTO app_settings(key,value,updated_at) VALUES('material_root',?,?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
+                (str(root_resolved), now()),
+            )
+
+        for index, path in enumerate(files, 1):
+            path_text = str(path.resolve())
+            scanned_at = now()
             try:
-                Path(material["file_path"]).resolve().relative_to(root_resolved)
-            except (ValueError, OSError):
-                outside_ids.append(material["id"])
-        if outside_ids:
-            marks = ",".join("?" for _ in outside_ids)
-            conn.execute(f"DELETE FROM generation_shot_materials WHERE material_id IN ({marks})", outside_ids)
-            conn.execute(f"DELETE FROM materials WHERE id IN ({marks})", outside_ids)
-        if allowed_names:
-            marks = ",".join("?" for _ in allowed_names)
-            obsolete = [r["id"] for r in conn.execute(
-                f"SELECT id FROM material_categories WHERE name NOT IN ({marks})", allowed_names
-            ).fetchall()]
-        else:
-            obsolete = [r["id"] for r in conn.execute("SELECT id FROM material_categories").fetchall()]
-        if obsolete:
-            marks = ",".join("?" for _ in obsolete)
-            conn.execute(f"UPDATE template_shots SET material_category_id=NULL WHERE material_category_id IN ({marks})", obsolete)
-            conn.execute(f"DELETE FROM material_categories WHERE id IN ({marks})", obsolete)
-        conn.execute(
-            """INSERT INTO app_settings(key,value,updated_at) VALUES('material_root',?,?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
-            (str(root_resolved), now()),
-        )
-    return {"total": len(files), "added": added, "updated": updated, "folder": folder}
+                stat = path.stat()
+                rel = path.resolve().relative_to(root_resolved)
+                category_name = rel.parts[0] if len(rel.parts) > 1 else "未分类"
+                with connect() as conn:
+                    cat = conn.execute("SELECT id FROM material_categories WHERE name=?", (category_name,)).fetchone()
+                    if not cat:
+                        max_order = int(conn.execute("SELECT COALESCE(MAX(sort_order),0)+1 FROM material_categories").fetchone()[0])
+                        conn.execute(
+                            "INSERT INTO material_categories(name,description,sort_order,created_at,updated_at) VALUES(?,?,?,?,?)",
+                            (category_name, "扫描目录自动创建", max_order, scanned_at, scanned_at),
+                        )
+                        category_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    else:
+                        category_id = int(cat[0])
+                    existing = conn.execute("SELECT * FROM materials WHERE file_path=?", (path_text,)).fetchone()
+
+                digest = ""
+                changed = existing is None
+                if existing is not None:
+                    stored_mtime = int(existing["file_mtime_ns"] or 0)
+                    stored_size = int(existing["size"] or 0)
+                    changed = stored_mtime != int(stat.st_mtime_ns) or stored_size != int(stat.st_size) or str(existing["status"] or "") != "active"
+                    # Old schema rows have no mtime. Verify once by hash, then
+                    # populate mtime without unnecessarily regenerating metadata.
+                    if stored_mtime == 0 or changed:
+                        digest = quick_hash(path)
+                        if digest == str(existing["file_hash"] or "") and str(existing["status"] or "") == "active":
+                            changed = False
+
+                if existing is not None and not changed:
+                    with connect() as conn:
+                        conn.execute(
+                            """UPDATE materials SET file_name=?,size=?,file_mtime_ns=?,status='active',scan_error='',last_scanned_at=? WHERE id=?""",
+                            (path.name, int(stat.st_size), int(stat.st_mtime_ns), scanned_at, int(existing["id"])),
+                        )
+                    result["unchanged"] += 1
+                else:
+                    digest = digest or quick_hash(path)
+                    # A missing record with the exact existing fingerprint is a
+                    # reliable rename/move candidate. Preserve its category/remark.
+                    renamed = None
+                    if existing is None:
+                        with connect() as conn:
+                            candidates = conn.execute(
+                                "SELECT * FROM materials WHERE file_hash=? AND file_path<>? ORDER BY id", (digest, path_text)
+                            ).fetchall()
+                        missing_candidates = [item for item in candidates if _path_key(item["file_path"]) not in disk_keys and not Path(item["file_path"]).is_file()]
+                        if len(missing_candidates) == 1:
+                            renamed = missing_candidates[0]
+                            existing = renamed
+
+                    info = probe_video(path, ffprobe)
+                    thumb, thumb_warning = make_thumbnail_with_status(path, digest, ffmpeg)
+                    probe_error = str(info.get("error") or "")
+                    usable = not probe_error
+                    scan_error = probe_error or thumb_warning
+                    if scan_error:
+                        result["errors"] += 1
+                        result["error_items"].append({"file": path.name, "path": path_text, "reason": scan_error})
+                    material_status = "active" if usable else "error"
+                    old_thumb = str(existing["thumbnail_path"] or "") if existing is not None else ""
+                    with connect() as conn:
+                        if existing is not None:
+                            # Preserve user classification and remarks for same-path
+                            # replacement and fingerprint-confirmed rename.
+                            conn.execute(
+                                """UPDATE materials SET file_path=?,file_name=?,file_hash=?,duration=?,width=?,height=?,fps=?,size=?,
+                                   file_mtime_ns=?,codec=?,thumbnail_path=?,status=?,scan_error=?,last_scanned_at=?,updated_at=? WHERE id=?""",
+                                (path_text, path.name, digest, float(info.get("duration") or 0), int(info.get("width") or 0),
+                                 int(info.get("height") or 0), float(info.get("fps") or 0), int(info.get("size") or stat.st_size),
+                                 int(stat.st_mtime_ns), str(info.get("codec") or ""), thumb, material_status, scan_error,
+                                 scanned_at, scanned_at, int(existing["id"])),
+                            )
+                            result["updated"] += 1
+                        else:
+                            conn.execute(
+                                """INSERT INTO materials(category_id,file_path,file_name,file_hash,duration,width,height,fps,size,
+                                   file_mtime_ns,codec,thumbnail_path,status,scan_error,last_scanned_at,created_at,updated_at)
+                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (category_id, path_text, path.name, digest, float(info.get("duration") or 0), int(info.get("width") or 0),
+                                 int(info.get("height") or 0), float(info.get("fps") or 0), int(info.get("size") or stat.st_size),
+                                 int(stat.st_mtime_ns), str(info.get("codec") or ""), thumb, material_status, scan_error,
+                                 scanned_at, scanned_at, scanned_at),
+                            )
+                            result["added"] += 1
+                    if old_thumb and old_thumb != thumb:
+                        old_path = Path(old_thumb)
+                        if old_path.is_file() and old_path.parent == THUMB_DIR:
+                            try:
+                                old_path.unlink()
+                            except OSError:
+                                pass
+            except Exception as exc:
+                reason = _material_error_text(exc)
+                result["errors"] += 1
+                result["error_items"].append({"file": path.name, "path": str(path), "reason": reason})
+                with connect() as conn:
+                    existing = conn.execute("SELECT id FROM materials WHERE file_path=?", (path_text,)).fetchone()
+                    if existing:
+                        conn.execute(
+                            "UPDATE materials SET status='error',scan_error=?,last_scanned_at=?,updated_at=? WHERE id=?",
+                            (reason, scanned_at, scanned_at, int(existing["id"])),
+                        )
+                    else:
+                        conn.execute(
+                            """INSERT INTO materials(category_id,file_path,file_name,status,scan_error,last_scanned_at,created_at,updated_at)
+                               VALUES(NULL,?,?,'error',?,?,?,?)""",
+                            (path_text, path.name, reason, scanned_at, scanned_at, scanned_at),
+                        )
+                        result["added"] += 1
+            finally:
+                with connect() as conn:
+                    conn.execute(
+                        """UPDATE scan_tasks SET scanned_files=?,added_count=?,updated_count=?,error_count=?,unchanged_count=? WHERE id=?""",
+                        (index, result["added"], result["updated"], result["errors"], result["unchanged"], scan_id),
+                    )
+
+        # Any indexed file not present under the newly authoritative root is
+        # retained for history but excluded from the normal list and matcher.
+        with connect() as conn:
+            all_materials = conn.execute("SELECT id,file_path,status FROM materials").fetchall()
+            missing_ids = [int(item["id"]) for item in all_materials if _path_key(item["file_path"]) not in disk_keys and str(item["status"] or "") != "missing"]
+            if missing_ids:
+                marks = ",".join("?" for _ in missing_ids)
+                conn.execute(
+                    f"UPDATE materials SET status='missing',scan_error='文件已丢失',last_scanned_at=?,updated_at=? WHERE id IN ({marks})",
+                    (now(), now(), *missing_ids),
+                )
+            result["missing"] = len(missing_ids)
+            conn.execute(
+                """UPDATE scan_tasks SET status='completed',scanned_files=?,added_count=?,updated_count=?,missing_count=?,
+                   error_count=?,unchanged_count=?,skipped_count=?,finished_at=? WHERE id=?""",
+                (len(files), result["added"], result["updated"], result["missing"], result["errors"],
+                 result["unchanged"], result["unchanged"], now(), scan_id),
+            )
+        return result
+    except Exception as exc:
+        if scan_id:
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE scan_tasks SET status='failed',error_message=?,finished_at=? WHERE id=?",
+                    (_material_error_text(exc), now(), scan_id),
+                )
+        raise
+    finally:
+        MATERIAL_SCAN_LOCK.release()
 
 
 def save_profile(data):
@@ -1250,21 +2535,125 @@ def create_task(data):
         raise ValueError("模板不存在或没有镜头")
     name = str(data.get("task_name") or f"{template['name']} - {now()}")
     with connect() as conn:
-        conn.execute("INSERT INTO generation_tasks(template_id,task_name,status,progress,total_shots,created_at,updated_at) VALUES(?,?, 'pending',0,?,?,?)",
-                     (template_id, name, len(shots), now(), now()))
-        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("BEGIN IMMEDIATE")
+        queue_seq = reserve_generation_queue_seqs(conn, 1)[0]
+        stamp = now()
+        if generation_queue_seq_supported(conn):
+            conn.execute("INSERT INTO generation_tasks(template_id,task_name,status,queue_seq,progress,total_shots,created_at,updated_at) VALUES(?,?, 'queued',?,0,?,?,?)",
+                         (template_id, name, queue_seq, len(shots), stamp, stamp))
+        else:
+            conn.execute("INSERT INTO generation_tasks(template_id,task_name,status,progress,total_shots,created_at,updated_at) VALUES(?,?, 'queued',0,?,?,?)",
+                         (template_id, name, len(shots), stamp, stamp))
+        task_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+        conn.commit()
+    initialize_task_log(task_id, name)
+    return task_id
 
 
-def start_generate(task_id: int):
-    task = row("SELECT * FROM generation_tasks WHERE id=?", (task_id,))
-    if not task:
-        raise ValueError("任务不存在")
+def single_generation_preflight(template_id: int) -> dict:
+    template = row("SELECT * FROM edit_templates WHERE id=?", (int(template_id),))
+    shots = rows("SELECT * FROM template_shots WHERE template_id=? ORDER BY sort_order,id", (int(template_id),))
+    if not template:
+        raise ValueError("模板不存在")
+    if not shots:
+        raise ValueError("请先添加镜头")
+    missing_text, missing_category, missing_material = [], [], []
+    missing_required_voice = []
+    voice_ready = subtitle_ready = material_ready = 0
+    cfg = settings()
+    subtitles_enabled = str(cfg.get("subtitle_enabled") or "1") != "0"
+    for index, shot in enumerate(shots, 1):
+        label = shot.get("shot_name") or f"镜头{index}"
+        text = shot_script_text(shot).strip()
+        if not text:
+            missing_text.append(label)
+        category_id = int(shot.get("material_category_id") or 0)
+        if not category_id:
+            missing_category.append(label)
+        else:
+            available = next((item for item in rows(
+                "SELECT id,file_path FROM materials WHERE status='active' AND category_id=? AND file_path<>''",
+                (category_id,),
+            ) if Path(str(item.get("file_path") or "")).is_file()), None)
+            if not available:
+                missing_material.append(label)
+            else:
+                material_ready += 1
+        voice_path = Path(str(shot.get("voice_file_path") or ""))
+        if float(shot.get("voice_duration") or 0) > 0 and voice_path.is_file():
+            voice_ready += 1
+        elif str(cfg.get("tts_enabled") or "1") == "0" or not int(shot.get("enable_tts") or 0):
+            missing_required_voice.append(label)
+        subtitle_path = Path(str(shot.get("subtitle_file_path") or ""))
+        if not subtitles_enabled or not int(shot.get("enable_subtitle") or 0) or subtitle_path.is_file():
+            subtitle_ready += 1
+    if missing_text:
+        raise ValueError("以下镜头缺少文案：" + "、".join(missing_text))
+    if missing_category:
+        raise ValueError("以下镜头未选择素材分类：" + "、".join(missing_category))
+    if missing_material:
+        raise ValueError("素材不足，请补充：" + "、".join(missing_material))
+    if missing_required_voice:
+        raise ValueError("请先生成配音：" + "、".join(missing_required_voice))
+    return {
+        "template_id": int(template_id), "template_name": template["name"], "shot_count": len(shots),
+        "voice_ready_count": voice_ready, "subtitle_ready_count": subtitle_ready,
+        "material_ready_count": material_ready,
+        "estimated_duration": round(sum(float(item.get("voice_duration") or 0) for item in shots), 2),
+    }
+
+
+def create_and_start_single_task(data: dict) -> dict:
+    template_id = int(data.get("template_id") or 0)
+    summary = single_generation_preflight(template_id)
+    with GENERATION_START_LOCK:
+        active = row(
+            """SELECT * FROM generation_tasks WHERE template_id=?
+               AND NOT EXISTS(SELECT 1 FROM batch_task_items bi WHERE bi.task_id=generation_tasks.id)
+               AND status IN ('queued','preparing','rendering','verifying')
+               ORDER BY id DESC LIMIT 1""",
+            (template_id,),
+        )
+        if active and canonical_task_status(active["status"]) != "queued" and worker_is_alive(int(active["id"])):
+            return {"task_id": int(active["id"]), "status": active["status"], "duplicate": True, **summary}
+        if active:
+            task_id = int(active["id"])
+            reused = True
+        else:
+            task_id = int(create_task({
+                "template_id": template_id,
+                "task_name": str(data.get("task_name") or f"{summary['template_name']}-{now()}"),
+            }))
+            reused = False
+        started = start_generate(task_id)
+        return {**started, **summary, "duplicate": reused, "batch_size": 1}
+
+
+def start_generate(task_id: int, before_generation=None, *, queue_priority: int | None = None):
+    task_id = int(task_id)
+    with GENERATION_START_LOCK:
+        task = row("SELECT * FROM generation_tasks WHERE id=?", (task_id,))
+        if not task:
+            raise ValueError("任务不存在")
+        status = canonical_task_status(task["status"])
+        if status in {"preparing", "rendering", "verifying"}:
+            health = task_health_snapshot(task_id)
+            if health.get("worker_alive") or health.get("process_alive"):
+                return {"task_id": task_id, "status": status, "duplicate": True}
+            raise ValueError("任务处于异常执行状态，请先在任务中心诊断或终止并重试")
+        if status != "queued":
+            raise ValueError(f"当前任务状态 {status} 不能开始生成")
     cfg = settings()
     output_dir = cfg.get("output_dir", "")
     if not output_dir or not Path(output_dir).parent.exists():
         output_dir = str(APP_DIR / "outputs")
     def worker():
         try:
+          with task_context(task_id):
+            if before_generation is not None:
+                before_generation()
+            heartbeat(task_id, status="preparing", stage="preparing", step="读取镜头配置", progress=2,
+                      log="生成线程已启动")
             task_shots = rows("SELECT * FROM template_shots WHERE template_id=? ORDER BY sort_order,id", (task["template_id"],))
             selected_speed = float(cfg.get("tts_speed") or 1.0)
             selected_segment_gap_ms = int(float(cfg.get("tts_segment_gap_ms") or 60))
@@ -1307,8 +2696,11 @@ def start_generate(task_id: int):
                 previous_matches = {}
                 previous_materials = set()
             for index, shot in enumerate(task_shots, 1):
-                with connect() as conn:
-                    conn.execute("UPDATE generation_tasks SET status='processing_shot',current_shot=?,progress=?,updated_at=? WHERE id=?", (f"准备镜头 {index}/{len(task_shots)}", max(1, int(index / max(1, len(task_shots)) * 8)), now(), task_id))
+                check_cancelled(task_id)
+                base_progress = 3 + int((index - 1) / max(1, len(task_shots)) * 37)
+                heartbeat(task_id, status="preparing", stage="preparing_shot",
+                          step=f"准备镜头 {index}/{len(task_shots)}", item=str(shot.get("shot_name") or index),
+                          progress=base_progress)
                 current_text = shot_script_text(shot)
                 selected_voice, selected_tts_config = resolve_tts_voice(cfg, current_text)
                 voice_path = str(shot.get("voice_file_path") or "")
@@ -1321,6 +2713,8 @@ def start_generate(task_id: int):
                     )
                 )
                 if shot.get("enable_tts") and voice_stale:
+                    heartbeat(task_id, stage="tts", step=f"生成配音 {index}/{len(task_shots)}",
+                              progress=base_progress + 1)
                     generate_tts(shot["id"])
                     # A regenerated voice can have a different real duration, so
                     # its previous material crop is no longer valid.
@@ -1330,9 +2724,9 @@ def start_generate(task_id: int):
                 # Always trust ffprobe of the final audio file over cached DB or
                 # provider estimates before matching material and rendering.
                 previous_voice_duration = float(shot.get("voice_duration") or 0)
-                actual_voice_duration = audio_duration(
-                    str(shot.get("voice_file_path") or ""), cfg.get("ffprobe_path", "")
-                )
+                heartbeat(task_id, stage="ffprobe", step=f"检测语音时长 {index}/{len(task_shots)}",
+                          progress=base_progress + 2)
+                actual_voice_duration = audio_duration(str(shot.get("voice_file_path") or ""))
                 if actual_voice_duration <= 0:
                     raise ValueError(f"镜头 {shot.get('shot_name') or shot['id']} 无法读取真实语音时长")
                 duration_changed = abs(actual_voice_duration - previous_voice_duration) > 0.001
@@ -1359,6 +2753,8 @@ def start_generate(task_id: int):
                         or str(shot.get("subtitle_render_hash") or "") != expected_subtitle_hash
                     )
                     if subtitle_stale:
+                        heartbeat(task_id, stage="subtitle", step=f"生成字幕 {index}/{len(task_shots)}",
+                                  progress=base_progress + 3)
                         subtitle_path, _ = generate_ass_for_shot(
                             shot["id"], shot["voice_file_path"], text, float(shot.get("voice_duration") or 0)
                         )
@@ -1369,6 +2765,8 @@ def start_generate(task_id: int):
                             )
                 # Every generation task rematches.  The relation is task-scoped,
                 # so creating a new task never silently reuses the old preview.
+                heartbeat(task_id, stage="matching", step=f"匹配素材 {index}/{len(task_shots)}",
+                          progress=base_progress + 4)
                 relation = match_shot(
                     shot["id"],
                     exclude_ids=used_materials,
@@ -1383,14 +2781,197 @@ def start_generate(task_id: int):
                 ):
                     raise ValueError("避免重复策略下可用素材不足，请补充对应分类素材")
                 used_materials.append(relation["material_id"])
-            generate_video(task_id, task["template_id"], cfg.get("ffmpeg_path", ""), output_dir, cfg.get("work_dir", ""))
-        except Exception as exc:
+                heartbeat(task_id, stage="preparing_shot", step=f"镜头 {index}/{len(task_shots)} 已准备",
+                          progress=min(40, base_progress + 5))
+            heartbeat(task_id, status="rendering", stage="rendering", step="开始渲染成片", progress=42)
+            generate_video(task_id, task["template_id"], "", output_dir, cfg.get("work_dir", ""))
+        except TaskCancelled:
             with connect() as conn:
-                conn.execute("UPDATE generation_tasks SET status='failed',error_message=?,updated_at=? WHERE id=?", (str(exc), now(), task_id))
+                conn.execute(
+                    "UPDATE generation_tasks SET status='cancelled',current_stage='cancelled',current_step='已取消',"
+                    "current_shot='已取消',process_id=0,error_message='',finished_at=?,updated_at=? WHERE id=?",
+                    (now(), now(), task_id),
+                )
+        except BaseException as exc:
+            wrapped = exc if isinstance(exc, Exception) else RuntimeError(
+                f"生成线程被异常中断：{type(exc).__name__}: {exc}"
+            )
+            fail_task(task_id, wrapped)
+    with GENERATION_START_LOCK:
+        if GENERATION_QUEUE.is_pending(task_id):
+            current = row("SELECT status FROM generation_tasks WHERE id=?", (task_id,)) or {}
+            return {"task_id": task_id, "status": canonical_task_status(current.get("status")), "duplicate": True}
+        if queue_priority is None:
+            # A single durable sequence is shared by standalone and batch tasks.
+            # Batch membership must never jump a newer task ahead of an older one.
+            queue_priority = int(task.get("queue_seq") or task_id)
+        queued = GENERATION_QUEUE.enqueue(task_id, worker, priority=queue_priority)
+    current = row("SELECT status FROM generation_tasks WHERE id=?", (task_id,)) or {}
+    return {
+        "task_id": task_id,
+        "status": canonical_task_status(current.get("status")),
+        "duplicate": not queued,
+        "max_generation_concurrency": MAX_GENERATION_CONCURRENCY,
+    }
+
+
+def retry_generation_task(task_id: int) -> dict:
+    original_id = int(task_id)
+    terminate_process(original_id)
+    with GENERATION_START_LOCK:
+        task = row("SELECT * FROM generation_tasks WHERE id=?", (original_id,))
+        if not task:
+            raise ValueError("任务不存在")
+        if canonical_task_status(task["status"]) not in {"failed", "stalled", "cancelled", "queued", "paused"}:
+            raise ValueError("当前任务状态不能重试")
+        existing = row(
+            """SELECT id,status FROM generation_tasks WHERE retry_of_task_id=?
+               AND status IN ('queued','preparing','rendering','verifying')
+               ORDER BY id DESC LIMIT 1""", (original_id,)
+        )
+        if existing:
+            return {"task_id": int(existing["id"]), "status": existing["status"], "duplicate": True}
+        single_generation_preflight(int(task["template_id"] or 0))
+        cfg = settings()
+        find_ffmpeg()
+        output = Path(str(cfg.get("output_dir") or APP_DIR / "outputs"))
+        output.mkdir(parents=True, exist_ok=True)
+        probe = output / ".mixcut_write_test"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ValueError("输出目录不可写，请更换目录或检查磁盘权限") from exc
+        batch_item = row("SELECT id,batch_id,index_no FROM batch_task_items WHERE task_id=?", (original_id,))
+        retry_no = int(task.get("retry_count") or 0) + 1
+        retry_name = f"{task['task_name']} · 重试{retry_no}"
+        stamp = now()
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            queue_seq = reserve_generation_queue_seqs(conn, 1)[0]
+            if generation_queue_seq_supported(conn):
+                conn.execute(
+                    """INSERT INTO generation_tasks(template_id,task_name,status,queue_seq,progress,current_progress,total_shots,
+                           retry_count,retry_of_task_id,attempt_no,created_at,updated_at)
+                       VALUES(?,?,'queued',?,0,0,?,?,?,?,?,?)""",
+                    (task["template_id"], retry_name, queue_seq, task.get("total_shots") or 0, retry_no,
+                      original_id, retry_no + 1, stamp, stamp),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO generation_tasks(template_id,task_name,status,progress,current_progress,total_shots,
+                           retry_count,retry_of_task_id,attempt_no,created_at,updated_at)
+                       VALUES(?,?,'queued',0,0,?,?,?,?,?,?)""",
+                    (task["template_id"], retry_name, task.get("total_shots") or 0, retry_no,
+                      original_id, retry_no + 1, stamp, stamp),
+                )
+            new_task_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            if batch_item:
+                conn.execute(
+                    "UPDATE batch_task_items SET task_id=?,status='queued',output_path='',error_message='',updated_at=? WHERE id=?",
+                    (new_task_id, stamp, int(batch_item["id"])),
+                )
+                conn.execute(
+                    "UPDATE batch_tasks SET status='queued',finished_at='',updated_at=? WHERE id=?",
+                    (stamp, int(batch_item["batch_id"])),
+                )
+            conn.execute("UPDATE generation_tasks SET retry_count=? WHERE id=?", (retry_no, original_id))
+            conn.commit()
+        initialize_task_log(new_task_id, retry_name)
+    if batch_item:
+        BATCH_QUEUE.enqueue(int(batch_item["batch_id"]), start_batch_generation)
+        return {"task_id": new_task_id, "status": "queued", "batch_id": int(batch_item["batch_id"]), "duplicate": False}
+    return {**start_generate(new_task_id), "retry_of_task_id": original_id}
+
+
+def mark_generation_failed(task_id: int) -> dict:
+    task_id = int(task_id)
+    task = row("SELECT status FROM generation_tasks WHERE id=?", (task_id,))
+    if not task:
+        raise ValueError("\u4efb\u52a1\u4e0d\u5b58\u5728")
+    terminate_process(task_id)
+    reason = "\u7528\u6237\u5df2\u5c06\u505c\u6ede\u4efb\u52a1\u6807\u8bb0\u4e3a\u5931\u8d25"
+    item = None
     with connect() as conn:
-        conn.execute("UPDATE generation_tasks SET status='running',current_shot=?,progress=1,error_message='',updated_at=? WHERE id=?", ("等待准备", now(), task_id))
-    threading.Thread(target=worker, daemon=True).start()
-    return {"task_id": task_id, "status": "running"}
+        conn.execute(
+            """UPDATE generation_tasks SET status='failed',current_stage='failed',
+               current_step='\u5df2\u6807\u8bb0\u5931\u8d25',current_shot='\u5df2\u6807\u8bb0\u5931\u8d25',
+               worker_id='',process_id=0,process_name='',ffmpeg_pid=0,ffprobe_pid=0,
+               error_code=CASE WHEN error_code='' THEN 'MANUALLY_FAILED' ELSE error_code END,
+               error_message=?,finished_at=?,updated_at=? WHERE id=?""",
+            (reason, now(), now(), task_id),
+        )
+        item = conn.execute(
+            "SELECT id,batch_id FROM batch_task_items WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if item:
+            conn.execute(
+                "UPDATE batch_task_items SET status='failed',error_message=?,updated_at=? WHERE id=?",
+                (reason, now(), int(item["id"])),
+            )
+    if item:
+        sync_batch(int(item["batch_id"]))
+    return {"task_id": task_id, "status": "failed"}
+
+
+def skip_generation_task_and_continue(task_id: int) -> dict:
+    """Skip one blocked batch child without treating it as an execution failure."""
+    task_id = int(task_id)
+    terminate_process(task_id)
+    stamp = now()
+    with connect() as conn:
+        task = conn.execute(
+            "SELECT status,task_name FROM generation_tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        item = conn.execute(
+            "SELECT id,batch_id,index_no FROM batch_task_items WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if not task or not item:
+            raise ValueError("只有批量任务中的异常子任务可以跳过")
+        status = canonical_task_status(task["status"])
+        if status not in {"failed", "stalled", "paused"}:
+            raise ValueError("当前任务状态不能跳过")
+        reason = "用户已跳过此条，批次将继续执行下一条"
+        conn.execute(
+            """UPDATE generation_tasks SET status='cancelled',current_stage='cancelled',
+               current_step='已跳过',current_shot='已跳过',worker_id='',process_id=0,
+               process_name='',ffmpeg_pid=0,ffprobe_pid=0,error_code='SKIPPED_BY_USER',
+               error_message=?,finished_at=?,updated_at=? WHERE id=?""",
+            (reason, stamp, stamp, task_id),
+        )
+        conn.execute(
+            "UPDATE batch_task_items SET status='cancelled',error_message=?,updated_at=? WHERE id=?",
+            (reason, stamp, int(item["id"])),
+        )
+        conn.execute(
+            "UPDATE batch_tasks SET status='queued',finished_at='',updated_at=? WHERE id=?",
+            (stamp, int(item["batch_id"])),
+        )
+    append_task_log(task_id, reason)
+    sync_batch(int(item["batch_id"]))
+    BATCH_QUEUE.enqueue(int(item["batch_id"]), start_batch_generation)
+    return {
+        "task_id": task_id,
+        "batch_id": int(item["batch_id"]),
+        "status": "cancelled",
+        "continued": True,
+    }
+
+
+def recover_standalone_generation_queue() -> list[int]:
+    """Restore queued non-batch jobs after the durable batch queue is restored."""
+    task_ids = [
+        int(item["id"])
+        for item in rows(
+            """SELECT g.id FROM generation_tasks g
+               WHERE g.status IN ('queued','pending')
+                 AND NOT EXISTS(SELECT 1 FROM batch_task_items bi WHERE bi.task_id=g.id)
+               ORDER BY CASE WHEN COALESCE(g.queue_seq,0)>0 THEN g.queue_seq ELSE g.id END,g.id"""
+        )
+    ]
+    for task_id in task_ids:
+        start_generate(task_id)
+    return task_ids
 
 
 def template_script_snapshot(template_id: int) -> tuple[str, list[str]]:
@@ -1405,7 +2986,7 @@ def template_script_snapshot(template_id: int) -> tuple[str, list[str]]:
 
 
 def start_batch_generation(task_id: int):
-    """Create a unique script version before calling the unchanged single-video flow."""
+    """Generate a unique script inside the globally claimed generation slot."""
     context = row(
         """SELECT b.id batch_id,b.total_count,i.index_no,g.template_id
            FROM batch_task_items i
@@ -1417,45 +2998,55 @@ def start_batch_generation(task_id: int):
     if not context:
         return start_generate(task_id)
 
-    with connect() as conn:
-        conn.execute(
-            "UPDATE generation_tasks SET status='running',current_shot=?,progress=1,error_message='',updated_at=? WHERE id=?",
-            (f"正在生成第 {context['index_no']} 条独立文案", now(), task_id),
+    def prepare_unique_script():
+        heartbeat(
+            task_id, status="preparing", stage="ai_rewrite",
+            step=f"\u751f\u6210\u7b2c {context['index_no']} \u6761\u72ec\u7acb\u6587\u6848", progress=1,
         )
+        previous = rows(
+            """SELECT i.index_no,g.template_id FROM batch_task_items i
+               JOIN generation_tasks g ON g.id=i.task_id
+               WHERE i.batch_id=? AND i.index_no<? ORDER BY i.index_no""",
+            (context["batch_id"], context["index_no"]),
+        )
+        previous_signatures = set()
+        previous_examples = []
+        for item in previous:
+            signature, texts = template_script_snapshot(item["template_id"])
+            if signature:
+                previous_signatures.add(signature)
+                previous_examples.append(f"\u7248\u672c{item['index_no']} " + " | ".join(texts))
 
-    previous = rows(
-        """SELECT i.index_no,g.template_id FROM batch_task_items i
-           JOIN generation_tasks g ON g.id=i.task_id
-           WHERE i.batch_id=? AND i.index_no<? ORDER BY i.index_no""",
-        (context["batch_id"], context["index_no"]),
-    )
-    previous_signatures = set()
-    previous_examples = []
-    for item in previous:
-        signature, texts = template_script_snapshot(item["template_id"])
-        if signature:
-            previous_signatures.add(signature)
-            previous_examples.append(f"版本{item['index_no']} " + " | ".join(texts))
+        current_signature = ""
+        for attempt in range(1, 4):
+            check_cancelled(task_id)
+            heartbeat(
+                task_id, stage="ai_rewrite",
+                step=f"\u751f\u6210\u72ec\u7acb\u6587\u6848 \u7b2c {attempt}/3 \u6b21\u5c1d\u8bd5",
+                progress=min(3, attempt),
+            )
+            variation = (
+                f"\u5f53\u524d\u9700\u8981\u751f\u6210\u7b2c {context['index_no']} \u6761 \u5171 {context['total_count']} \u6761 "
+                f"\u8fd9\u662f\u7b2c {attempt} \u6b21\u5dee\u5f02\u5316\u5c1d\u8bd5 \u5fc5\u987b\u4e0e\u5176\u4ed6\u7248\u672c\u660e\u663e\u4e0d\u540c"
+            )
+            if previous_examples:
+                variation += (
+                    "\n\u7981\u6b62\u590d\u7528\u4ee5\u4e0b\u5df2\u751f\u6210\u7248\u672c\u7684\u5b8c\u6574\u53e5\u5f0f\uff1a\n"
+                    + "\n".join(previous_examples[-8:])[:5000]
+                )
+            rewrite_template_shots(
+                context["template_id"], variation_context=variation,
+                temperature=min(0.95, 0.72 + attempt * 0.08),
+            )
+            current_signature, _ = template_script_snapshot(context["template_id"])
+            if current_signature and current_signature not in previous_signatures:
+                break
+        if not current_signature or current_signature in previous_signatures:
+            raise ValueError("\u0041\u0049 \u8fde\u7eed\u751f\u6210\u4e86\u91cd\u590d\u6587\u6848\uff0c\u8bf7\u91cd\u8bd5\u6216\u8c03\u6574\u539f\u59cb\u6587\u6848")
 
-    current_signature = ""
-    for attempt in range(1, 4):
-        variation = (
-            f"当前需要生成第 {context['index_no']} 条 共 {context['total_count']} 条 "
-            f"这是第 {attempt} 次差异化尝试 必须与其他版本明显不同"
-        )
-        if previous_examples:
-            variation += "\n禁止复用以下已生成版本的完整句式：\n" + "\n".join(previous_examples[-8:])[:5000]
-        rewrite_template_shots(
-            context["template_id"],
-            variation_context=variation,
-            temperature=min(0.95, 0.72 + attempt * 0.08),
-        )
-        current_signature, _ = template_script_snapshot(context["template_id"])
-        if current_signature and current_signature not in previous_signatures:
-            break
-    if not current_signature or current_signature in previous_signatures:
-        raise ValueError("AI 连续生成了重复文案，请重试或调整原始文案")
-    return start_generate(task_id)
+    # Batch continuations outrank standalone work already waiting in memory so
+    # one batch stays contiguous: 001 -> 002 -> 003.
+    return start_generate(task_id, before_generation=prepare_unique_script)
 
 
 class CommercialHandler(SimpleHTTPRequestHandler):
@@ -1482,10 +3073,57 @@ class CommercialHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
+            smart_result = smart_split_get(parsed.path, parse_qs(parsed.query))
+            if smart_result is not None:
+                return self.json_response({"ok": True, "data": smart_result})
             if parsed.path == "/api/bootstrap":
                 return self.json_response({"ok": True, "data": bootstrap()})
+            if parsed.path == "/api/runtime/media":
+                return self.json_response({"ok": True, "data": get_media_runtime_status()})
+            if parsed.path == "/api/materials/root":
+                return self.json_response({"ok": True, "data": material_root_status()})
             if parsed.path == "/api/dashboard/tasks":
                 return self.json_response({"ok": True, "data": dashboard_task_snapshot()})
+            if parsed.path == "/api/task-center/list":
+                query = parse_qs(parsed.query)
+                value = lambda key, default="": (query.get(key) or [default])[0]
+                result = task_center_list(
+                    view=value("view", "current"), page=int(value("page", 1) or 1),
+                    page_size=int(value("page_size", TASK_CENTER_PAGE_SIZE) or TASK_CENTER_PAGE_SIZE),
+                    status=value("status"), project_id=int(value("project_id", 0) or 0),
+                    date_from=value("date_from"), date_to=value("date_to"), keyword=value("keyword"),
+                )
+                return self.json_response({"ok": True, "data": result})
+            if parsed.path == "/api/task-center/tasks":
+                query = parse_qs(parsed.query)
+                value = lambda key, default="": (query.get(key) or [default])[0]
+                result = task_center_flat_list(
+                    view=value("view", "current"), page=int(value("page", 1) or 1),
+                    page_size=int(value("page_size", TASK_CENTER_PAGE_SIZE) or TASK_CENTER_PAGE_SIZE),
+                    status=value("status"), project_id=int(value("project_id", 0) or 0),
+                    batch_id=int(value("batch_id", 0) or 0), date_from=value("date_from"),
+                    date_to=value("date_to"), keyword=value("keyword"),
+                    focus_task_id=int(value("focus_task_id", 0) or 0),
+                )
+                return self.json_response({"ok": True, "data": result})
+            if parsed.path == "/api/tasks/current":
+                current = task_center_flat_list(view="current", page=1, page_size=100)
+                summary = dict(current.get("summary") or {})
+                summary["total_count"] = sum(summary.values())
+                summary["tasks"] = current.get("items") or []
+                summary["queue"] = current.get("queue") or {}
+                return self.json_response({"ok": True, "data": summary})
+            if parsed.path == "/api/generation-queue/status":
+                return self.json_response({"ok": True, "data": get_generation_queue_status()})
+            if parsed.path == "/api/tasks/invalid-scan":
+                return self.json_response({"ok": True, "data": scan_invalid_generation_tasks(False)})
+            task_items_match = re.fullmatch(r"/api/task-center/(batch|single)/(\d+)/items", parsed.path)
+            if task_items_match:
+                result = task_center_items(task_items_match.group(1), int(task_items_match.group(2)))
+                return self.json_response({"ok": True, "data": result})
+            task_log_match = re.fullmatch(r"/api/tasks/(\d+)/logs", parsed.path)
+            if task_log_match:
+                return self.json_response({"ok": True, "data": task_log_details(int(task_log_match.group(1)))})
             thumbnail_match = re.fullmatch(r"/api/dashboard/tasks/(\d+)/thumbnail", parsed.path)
             if thumbnail_match:
                 file_path = dashboard_task_thumbnail(int(thumbnail_match.group(1)))
@@ -1505,6 +3143,24 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 return self.json_response({"ok": True, "data": update_status()})
             if parsed.path == "/api/publish/capabilities":
                 return self.json_response({"ok": True, "data": {**publishing_capabilities(), "adapters": adapter_catalog(), "publishers": publisher_catalog(include_guarded=True)}})
+            preflight_match = re.fullmatch(r"/api/oauth/(youtube|facebook_page|facebook-page|instagram_business|instagram-business|x)/preflight", parsed.path)
+            if preflight_match:
+                query = parse_qs(parsed.query)
+                account_id = int((query.get("account_id") or [0])[0] or 0)
+                return self.json_response({"ok": True, "data": provider_preflight(preflight_match.group(1), account_id)})
+            session_match = re.fullmatch(r"/api/oauth/session/([^/]+)", parsed.path)
+            if session_match:
+                return self.json_response({"ok": True, "data": session_status(session_match.group(1))})
+            callback_match = re.fullmatch(r"/api/oauth/(youtube|facebook-page|instagram-business|x)/callback", parsed.path)
+            if callback_match:
+                query = parse_qs(parsed.query)
+                state = (query.get("state") or [""])[0]
+                if query.get("error"):
+                    code = query["error"][0]
+                    description = (query.get("error_description") or [""])[0]
+                    raise ValueError(cancel_authorization(state, code + ((": " + description) if description else "")))
+                result = complete_authorization(state, (query.get("code") or [""])[0], callback_match.group(1))
+                return self.json_response({"ok": True, "data": result})
             if parsed.path == "/api/oauth/callback":
                 query = parse_qs(parsed.query)
                 if query.get("error"):
@@ -1520,24 +3176,89 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                     return self.send_error(404)
                 mime = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
                 size = file_path.stat().st_size
-                self.send_response(200); self.send_header("Content-Type", mime); self.send_header("Content-Length", str(size)); self.send_header("Accept-Ranges", "bytes"); self.end_headers()
+                start, end, status = 0, max(0, size - 1), 200
+                range_header = str(self.headers.get("Range") or "").strip()
+                if range_header.startswith("bytes="):
+                    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                    if not match:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    first, last = match.groups()
+                    if first:
+                        start = int(first)
+                        end = min(int(last), size - 1) if last else size - 1
+                    elif last:
+                        suffix = min(int(last), size)
+                        start, end = size - suffix, size - 1
+                    if start >= size or end < start:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    status = 206
+                content_length = max(0, end - start + 1)
+                self.send_response(status)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(content_length))
+                self.send_header("Accept-Ranges", "bytes")
+                if status == 206:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.end_headers()
                 with file_path.open("rb") as f:
-                    while chunk := f.read(1024 * 1024): self.wfile.write(chunk)
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = f.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
                 return
             if parsed.path == "/settings" or parsed.path.startswith("/settings/"):
                 self.path = "/index.html"
             return super().do_GET()
         except Exception as exc:
-            return self.json_response({"ok": False, "error": str(exc), "trace": traceback.format_exc()}, 500)
+            return self.json_response({"ok": False, "error": str(exc)}, 500)
 
     def do_POST(self):
         parsed = urlparse(self.path)
         data = self.read_json()
         try:
+            smart_result = smart_split_post(parsed.path, data, scan_materials)
+            if smart_result is not None:
+                return self.json_response({"ok": True, "data": smart_result})
             result = None
             if parsed.path == "/api/select-folder": result = {"path": select_folder()}
+            elif parsed.path == "/api/materials/open-root": result = open_material_root()
             elif parsed.path == "/api/select-cover": result = {"path": select_cover_file()}
-            elif parsed.path == "/api/select-google-oauth-client": result = select_google_oauth_client()
+            elif parsed.path == "/api/select-google-oauth-client":
+                if not is_admin_mode():
+                    raise ValueError("只有管理员可以导入平台 OAuth 配置")
+                result = select_google_oauth_client()
+            elif re.fullmatch(r"/api/oauth/(youtube|facebook_page|facebook-page|instagram_business|instagram-business|x)/config", parsed.path):
+                if not is_admin_mode():
+                    raise ValueError("只有管理员可以配置平台开发者接入")
+                provider = parsed.path.split("/")[3]
+                result = save_provider_config(provider, data)
+            elif re.fullmatch(r"/api/oauth/(youtube|facebook_page|facebook-page|instagram_business|instagram-business|x)/start", parsed.path):
+                provider = parsed.path.split("/")[3]
+                account_id = int(data.get("account_id") or 0)
+                platform, account = publishing_account_context(account_id)
+                expected = {"facebook_page": "facebook", "facebook-page": "facebook", "instagram_business": "instagram", "instagram-business": "instagram"}.get(provider, provider)
+                if str(platform.get("code")) != expected:
+                    raise ValueError("当前账号与授权平台不一致")
+                result = start_authorization(platform, account)
+            elif re.fullmatch(r"/api/oauth/session/[^/]+/select", parsed.path):
+                state = parsed.path.split("/")[4]
+                result = select_oauth_account(state, str(data.get("external_id") or ""))
+            elif re.fullmatch(r"/api/oauth/session/[^/]+/cancel", parsed.path):
+                state = parsed.path.split("/")[4]
+                result = {"status": "authorization_cancelled", "message": cancel_authorization(state)}
+            elif re.fullmatch(r"/api/oauth/session/[^/]+/reopen", parsed.path):
+                state = parsed.path.split("/")[4]
+                result = reopen_authorization(state)
             elif parsed.path == "/api/select-voice-sample": result = {"path": select_voice_sample()}
             elif parsed.path == "/api/update/check": result = check_configured_update()
             elif parsed.path == "/api/update/apply": result = apply_configured_update()
@@ -1546,11 +3267,11 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 with connect() as conn: conn.execute("UPDATE materials SET category_id=?,updated_at=? WHERE id=?", (int(data.get("category_id") or 0) or None, now(), int(data["material_id"])))
                 result = True
             elif parsed.path == "/api/bgm/scan":
-                folder = str(data.get("folder_path", "")); result = scan_bgm_folder(folder, settings().get("ffprobe_path", ""))
+                folder = str(data.get("folder_path", "")); result = scan_bgm_folder(folder)
                 with connect() as conn: conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('bgm_dir',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (folder, now()))
             elif parsed.path == "/api/sfx/scan":
                 folder = str(data.get("folder_path", ""))
-                result = scan_sfx_folder(folder, settings().get("ffprobe_path", ""))
+                result = scan_sfx_folder(folder)
                 with connect() as conn:
                     conn.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('sfx_dir',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (folder, now()))
             elif parsed.path == "/api/transitions":
@@ -1565,6 +3286,13 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = True
             elif parsed.path == "/api/profiles": result = {"id": save_profile(data)}
             elif parsed.path == "/api/publish/accounts": result = {"id": save_publishing_account(data)}
+            elif parsed.path == "/api/publish/groups": result = {"id": save_account_group(data)}
+            elif re.fullmatch(r"/api/publish/groups/\d+", parsed.path): result = {"id": save_account_group(data, int(parsed.path.split("/")[4]))}
+            elif re.fullmatch(r"/api/publish/groups/\d+/copy", parsed.path): result = {"id": copy_account_group(int(parsed.path.split("/")[4]))}
+            elif parsed.path == "/api/publish/group-batches/preflight": result = group_publish_preflight(data)
+            elif parsed.path == "/api/publish/group-batches": result = create_group_publish_batch(data)
+            elif re.fullmatch(r"/api/publish/group-batches/\d+/retry-failed", parsed.path):
+                result = retry_group_batch_failed(int(parsed.path.split("/")[4]))
             elif parsed.path == "/api/publish/tasks":
                 publish_task_id = create_publish_task(data)
                 with connect() as conn:
@@ -1578,11 +3306,45 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = generate_publish_content(
                     int(data.get("video_id") or 0), str(data.get("platform") or "douyin"),
                     int(data.get("profile_id") or 0) or None, str(data.get("current_title") or ""),
+                    str(data.get("current_tags") or ""), str(data.get("current_cover_text") or ""),
+                )
+            elif re.fullmatch(r"/api/publish/drafts/\d+/metadata", parsed.path):
+                task_id = int(parsed.path.split("/")[4])
+                result = save_draft_field(
+                    task_id,
+                    str(data.get("field") or ""),
+                    str(data.get("value") or ""),
+                    str(data.get("state") or "manually_edited"),
                 )
             elif re.fullmatch(r"/api/publish/tasks/\d+/enqueue", parsed.path):
                 result = enqueue_publish_task(int(parsed.path.split("/")[4]))
                 PUBLISH_WORKER.wake()
             elif re.fullmatch(r"/api/publish/accounts/\d+/login", parsed.path):
+                result = start_account_login(
+                    int(parsed.path.split("/")[4]),
+                    str(data.get("login_mode") or "qr"),
+                )
+            elif re.fullmatch(r"/api/publish/accounts/\d+/login/status", parsed.path):
+                account_id = int(parsed.path.split("/")[4])
+                platform, account = publishing_account_context(account_id)
+                platform_code = str(platform.get("code") or "")
+                if platform_code == "tiktok":
+                    result = tiktok_login_status(account_id, account)
+                elif platform_code in DOMESTIC_LOGIN_PLATFORMS:
+                    result = domestic_login_status(account_id, {**account, "platform_code": platform_code})
+                else:
+                    raise ValueError("当前平台不支持登录会话状态查询")
+            elif re.fullmatch(r"/api/publish/accounts/\d+/login/cancel", parsed.path):
+                account_id = int(parsed.path.split("/")[4])
+                platform, _account = publishing_account_context(account_id)
+                platform_code = str(platform.get("code") or "")
+                if platform_code == "tiktok":
+                    result = cancel_tiktok_login(account_id)
+                elif platform_code in DOMESTIC_LOGIN_PLATFORMS:
+                    result = cancel_domestic_login(account_id)
+                else:
+                    raise ValueError("当前平台不支持取消登录会话")
+            elif re.fullmatch(r"/api/publish/accounts/\d+/login/reopen", parsed.path):
                 result = start_account_login(int(parsed.path.split("/")[4]))
             elif re.fullmatch(r"/api/publish/accounts/\d+/authorize", parsed.path):
                 result = start_account_login(int(parsed.path.split("/")[4]))
@@ -1630,21 +3392,45 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 template_id = int(parsed.path.split("/")[3])
                 result = rewrite_template_shots(template_id, int(data.get("profile_id") or 0) or None)
             elif parsed.path == "/api/tasks": result = {"id": create_task(data)}
+            elif parsed.path == "/api/tasks/start-single": result = create_and_start_single_task(data)
             elif re.fullmatch(r"/api/dashboard/tasks/\d+/open-output", parsed.path):
                 result = open_task_output(int(parsed.path.split("/")[4]))
+            elif re.fullmatch(r"/api/tasks/\d+/open-log", parsed.path):
+                result = open_task_log(int(parsed.path.split("/")[3]))
             elif parsed.path == "/api/batches":
-                batch_id = create_batch_task(data)
-                BATCH_QUEUE.enqueue(batch_id, start_batch_generation)
-                result = {"id": batch_id, "status": "pending"}
+                result = create_batch_task(data, detailed=True)
+                if int(result.get("created_count") or 0) <= 0 or len(result.get("task_ids") or []) != int(result.get("created_count") or 0):
+                    raise RuntimeError("批量任务创建失败：没有写入有效的视频生成任务")
+                BATCH_QUEUE.enqueue(int(result["batch_id"]), start_batch_generation)
+                result["id"] = int(result["batch_id"])
             elif parsed.path == "/api/tasks/clear-completed":
                 with connect() as conn:
-                    completed_ids = [r["id"] for r in conn.execute("SELECT id FROM generation_tasks WHERE status='completed'").fetchall()]
+                    completed_ids = [r["id"] for r in conn.execute("SELECT id FROM generation_tasks WHERE status IN ('succeeded','completed')").fetchall()]
                     if completed_ids:
                         marks = ",".join("?" for _ in completed_ids)
                         conn.execute(f"DELETE FROM generation_shot_materials WHERE task_id IN ({marks})", completed_ids)
-                    result = {"deleted": conn.execute("DELETE FROM generation_tasks WHERE status='completed'").rowcount}
+                    result = {"deleted": conn.execute("DELETE FROM generation_tasks WHERE status IN ('succeeded','completed')").rowcount}
+            elif parsed.path == "/api/task-center/delete-records":
+                result = delete_task_center_records(list(data.get("records") or []), bool(data.get("delete_outputs")))
+            elif parsed.path == "/api/task-center/delete-old-completed":
+                result = delete_old_completed_records(bool(data.get("delete_outputs")))
+            elif parsed.path == "/api/tasks/bulk-delete":
+                result = delete_generation_task_records(list(data.get("task_ids") or []), bool(data.get("delete_outputs")))
+            elif parsed.path == "/api/tasks/cleanup-records":
+                result = cleanup_generation_task_records(list(data.get("statuses") or []), str(data.get("age") or "all"), bool(data.get("delete_outputs")))
+            elif parsed.path == "/api/tasks/cleanup-invalid":
+                result = scan_invalid_generation_tasks(True)
+            elif parsed.path == "/api/generation-queue/repair":
+                result = repair_generation_queue()
             elif re.fullmatch(r"/api/tasks/\d+/generate", parsed.path): result = start_generate(int(parsed.path.split("/")[3]))
+            elif re.fullmatch(r"/api/tasks/\d+/retry", parsed.path): result = retry_generation_task(int(parsed.path.split("/")[3]))
+            elif re.fullmatch(r"/api/tasks/\d+/cancel", parsed.path): result = cancel_task(int(parsed.path.split("/")[3]))
+            elif re.fullmatch(r"/api/tasks/\d+/mark-failed", parsed.path): result = mark_generation_failed(int(parsed.path.split("/")[3]))
+            elif re.fullmatch(r"/api/tasks/\d+/skip-and-continue", parsed.path): result = skip_generation_task_and_continue(int(parsed.path.split("/")[3]))
+            elif re.fullmatch(r"/api/tasks/\d+/delete-and-continue", parsed.path): result = delete_generation_task_and_continue(int(parsed.path.split("/")[3]))
             elif parsed.path == "/api/settings":
+                data.pop("ffmpeg_path", None)
+                data.pop("ffprobe_path", None)
                 old_settings = settings()
                 voice_changed = any(
                     key in data and str(data.get(key)) != str(old_settings.get(key, ""))
@@ -1660,11 +3446,26 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                             (now(),),
                         )
                         conn.execute("DELETE FROM generation_shot_materials WHERE task_id IS NULL")
-                result = settings()
+                result = public_settings()
+            elif parsed.path == "/api/runtime/media/recheck":
+                result = get_media_runtime_status(refresh=True)
+            elif parsed.path == "/api/title-template":
+                result = save_title_template(data)
+            elif parsed.path == "/api/title-template/activate":
+                result = activate_title_template(data.get("template_scope"))
+            elif parsed.path == "/api/title-template/reset":
+                result = reset_title_template(data.get("template_scope"))
             elif parsed.path == "/api/title-preview":
                 result = generate_title_preview(data)
             else: return self.json_response({"ok": False, "error": "接口不存在"}, 404)
             return self.json_response({"ok": True, "data": result})
+        except PublishAIError as exc:
+            return self.json_response({
+                "ok": False,
+                "error": exc.user_message,
+                "code": exc.code,
+                "log_id": exc.log_id,
+            }, 400)
         except Exception as exc:
             return self.json_response({"ok": False, "error": str(exc)}, 400)
 
@@ -1680,9 +3481,15 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 with connect() as conn:
                     conn.execute("DELETE FROM batch_tasks WHERE id=?", (batch_id,))
                 return self.json_response({"ok": True})
+            group_match = re.fullmatch(r"/api/publish/groups/(\d+)", parsed.path)
+            if group_match:
+                delete_account_group(int(group_match.group(1)))
+                return self.json_response({"ok": True})
             publish_match = re.fullmatch(r"/api/publish/accounts/(\d+)", parsed.path)
             if publish_match:
                 with connect() as conn:
+                    conn.execute("DELETE FROM oauth_sessions WHERE account_id=?", (int(publish_match.group(1)),))
+                    conn.execute("DELETE FROM oauth_tokens WHERE account_id=?", (int(publish_match.group(1)),))
                     conn.execute("UPDATE publish_accounts SET status='deleted',updated_at=? WHERE id=?", (now(), int(publish_match.group(1))))
                 return self.json_response({"ok": True})
             publish_task_match = re.fullmatch(r"/api/publish/tasks/(\d+)", parsed.path)
@@ -1706,11 +3513,25 @@ class CommercialHandler(SimpleHTTPRequestHandler):
 
 def prepare():
     init_db()
+    # Retain legacy columns/keys for schema compatibility, but purge values so
+    # paths from another machine can never leak back into runtime behavior/UI.
+    with connect() as conn:
+        conn.execute(
+            "UPDATE app_settings SET value='',updated_at=? WHERE key IN ('ffmpeg_path','ffprobe_path') AND value<>''",
+            (now(),),
+        )
+    recover_smart_split_jobs()
     migrate_provider_secrets()
+    repair_missing_publish_records()
     cfg = settings()
     output = cfg.get("output_dir", "")
     if not output or not Path(output).parent.exists():
         with connect() as conn:
             conn.execute("UPDATE app_settings SET value=?,updated_at=? WHERE key='output_dir'", (str(APP_DIR / "outputs"), now()))
+    # Consumers exist for the whole application lifetime.  Recovery merely
+    # registers durable DB rows; it no longer owns worker lifecycle.
+    ensure_generation_worker_running()
     recover_and_enqueue(start_batch_generation)
+    recover_standalone_generation_queue()
+    start_generation_watchdog()
     start_publish_worker()
