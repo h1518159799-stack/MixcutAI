@@ -115,7 +115,7 @@ try {
         & $MediaPath -version 2>$null | Select-Object -First 1 | Write-Host
         if ($LASTEXITCODE -ne 0) { throw "Bundled media runtime is not executable: $MediaBinary" }
     }
-    foreach ($Document in @("README_使用说明.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt")) {
+    foreach ($Document in @("使用说明.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt")) {
         Copy-Item (Join-Path $AppDir $Document) (Join-Path $StageDir $Document) -Force
     }
     $UserZip = "$ReleaseDir\MixcutAI-v$Version-win64.zip"
@@ -145,7 +145,7 @@ try {
         "  browser/chromium/ (bundled Chromium)",
         "  runtime/ffmpeg/bin/ffmpeg.exe",
         "  runtime/ffmpeg/bin/ffprobe.exe",
-        "  README_使用说明.txt / CHANGELOG.txt / LICENSE.txt / THIRD_PARTY_NOTICES.txt / VERSION.txt",
+        "  使用说明.txt / CHANGELOG.txt / LICENSE.txt / THIRD_PARTY_NOTICES.txt / VERSION.txt",
         "  混剪素材/",
         "    操作过程 / 产品 / 产品展示 / 店内环境 / 服务过程 / 空镜 / 门头 / 人物",
         "",
@@ -171,4 +171,3 @@ try {
 } finally {
     Pop-Location
 }
-

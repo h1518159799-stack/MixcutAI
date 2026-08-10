@@ -26,7 +26,7 @@ ALLOWED_ROOT = {
     "MixcutAI.exe",
     "MixcutUpdater.exe",
     "default_config.json",
-    "README_使用说明.txt",
+    "使用说明.txt",
     "CHANGELOG.txt",
     "LICENSE.txt",
     "THIRD_PARTY_NOTICES.txt",
