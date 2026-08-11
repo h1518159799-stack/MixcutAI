@@ -2848,7 +2848,22 @@ def retry_generation_task(task_id: int) -> dict:
         stamp = now()
         with connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            queue_seq = reserve_generation_queue_seqs(conn, 1)[0]
+            allocated_queue_seq = reserve_generation_queue_seqs(conn, 1)[0]
+            queue_seq = allocated_queue_seq
+            # A failed batch child must be retried in its original position.
+            # Appending it behind its still-queued siblings creates a cycle:
+            # the global queue waits for the older sibling while the batch
+            # queue refuses to start that sibling until this retry completes.
+            if (
+                batch_item
+                and generation_queue_seq_supported(conn)
+                and int(task.get("queue_seq") or 0) > 0
+            ):
+                queue_seq = int(task["queue_seq"])
+                conn.execute(
+                    "UPDATE generation_tasks SET queue_seq=? WHERE id=?",
+                    (allocated_queue_seq, original_id),
+                )
             if generation_queue_seq_supported(conn):
                 conn.execute(
                     """INSERT INTO generation_tasks(template_id,task_name,status,queue_seq,progress,current_progress,total_shots,

@@ -25,6 +25,7 @@ class GenerationSchedulerV20Tests(unittest.TestCase):
                 CREATE TABLE generation_tasks(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,template_id INTEGER,task_name TEXT,status TEXT DEFAULT 'queued',
                     progress INTEGER DEFAULT 0,current_progress INTEGER DEFAULT 0,current_shot TEXT DEFAULT '',
+                    queue_seq INTEGER NOT NULL DEFAULT 0,
                     total_shots INTEGER DEFAULT 0,output_path TEXT DEFAULT '',error_message TEXT DEFAULT '',
                     created_at TEXT DEFAULT '',updated_at TEXT DEFAULT '',started_at TEXT DEFAULT '',finished_at TEXT DEFAULT '',
                     last_heartbeat_at TEXT DEFAULT '',current_stage TEXT DEFAULT '',current_step TEXT DEFAULT '',
@@ -36,6 +37,7 @@ class GenerationSchedulerV20Tests(unittest.TestCase):
                 );
                 CREATE UNIQUE INDEX uq_single_active_generation_slot ON generation_tasks((1))
                     WHERE status IN ('preparing','rendering','verifying');
+                CREATE UNIQUE INDEX uq_generation_tasks_queue_seq ON generation_tasks(queue_seq) WHERE queue_seq>0;
                 CREATE TABLE batch_tasks(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,template_id INTEGER,total_count INTEGER DEFAULT 0,
                     completed_count INTEGER DEFAULT 0,failed_count INTEGER DEFAULT 0,status TEXT DEFAULT 'queued',
@@ -172,6 +174,9 @@ class GenerationSchedulerV20Tests(unittest.TestCase):
     def test_retry_preserves_original_and_replaces_only_current_batch_item(self):
         batch_id, task_ids = self.make_batch(["stalled", "succeeded"], [22, 100])
         original = task_ids[0]
+        with self.connect() as conn:
+            conn.execute("UPDATE generation_tasks SET queue_seq=10 WHERE id=?", (task_ids[0],))
+            conn.execute("UPDATE generation_tasks SET queue_seq=11 WHERE id=?", (task_ids[1],))
         original_log = Path(self.temp.name) / "logs" / f"{original}.log"
         task_runtime.initialize_task_log(original, "original")
         original_log.write_text("original failure evidence", encoding="utf-8")
@@ -185,10 +190,15 @@ class GenerationSchedulerV20Tests(unittest.TestCase):
         self.assertIn("original failure evidence", original_log.read_text(encoding="utf-8"))
         with self.connect() as conn:
             current_ids = [row[0] for row in conn.execute("SELECT task_id FROM batch_task_items WHERE batch_id=? ORDER BY index_no", (batch_id,))]
-            old = conn.execute("SELECT status,retry_count FROM generation_tasks WHERE id=?", (original,)).fetchone()
+            old = conn.execute("SELECT status,retry_count,queue_seq FROM generation_tasks WHERE id=?", (original,)).fetchone()
+            retry = conn.execute("SELECT queue_seq FROM generation_tasks WHERE id=?", (result["task_id"],)).fetchone()
+            sibling = conn.execute("SELECT queue_seq FROM generation_tasks WHERE id=?", (task_ids[1],)).fetchone()
         self.assertEqual(current_ids, [result["task_id"], task_ids[1]])
         self.assertEqual(old["status"], "stalled")
         self.assertEqual(old["retry_count"], 1)
+        self.assertEqual(retry["queue_seq"], 10)
+        self.assertEqual(sibling["queue_seq"], 11)
+        self.assertGreater(old["queue_seq"], sibling["queue_seq"])
         enqueue.assert_called_once()
 
 
