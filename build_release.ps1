@@ -112,8 +112,13 @@ try {
     foreach ($MediaBinary in @("ffmpeg.exe", "ffprobe.exe")) {
         $MediaPath = Join-Path $BundledFFmpegDir $MediaBinary
         if (-not (Test-Path $MediaPath)) { throw "Bundled media runtime missing after copy: $MediaBinary" }
-        & $MediaPath -version 2>$null | Select-Object -First 1 | Write-Host
-        if ($LASTEXITCODE -ne 0) { throw "Bundled media runtime is not executable: $MediaBinary" }
+        # Consume the full native output before selecting its first line.
+        # Select-Object -First used to close FFmpeg's pipe early and could turn
+        # a healthy binary into a false non-zero release-gate failure.
+        $MediaVersionOutput = @(& $MediaPath -version 2>&1)
+        $MediaExitCode = $LASTEXITCODE
+        if ($MediaVersionOutput.Count -gt 0) { Write-Host ([string]$MediaVersionOutput[0]) }
+        if ($MediaExitCode -ne 0) { throw "Bundled media runtime is not executable: $MediaBinary" }
     }
     foreach ($Document in @("使用说明.txt", "CHANGELOG.txt", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "VERSION.txt")) {
         Copy-Item (Join-Path $AppDir $Document) (Join-Path $StageDir $Document) -Force
