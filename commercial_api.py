@@ -227,6 +227,10 @@ def public_settings() -> dict[str, str]:
     values.pop("ffprobe_path", None)
     return values
 
+def style_presets() -> dict:
+    from style_presets import TITLE_STYLE_PRESETS, SUBTITLE_STYLE_PRESETS
+    return {'title': TITLE_STYLE_PRESETS, 'subtitle': SUBTITLE_STYLE_PRESETS}
+
 
 TITLE_TEMPLATE_SCOPES = {"domestic", "overseas"}
 TITLE_TEMPLATE_KEYS = (
@@ -3453,6 +3457,8 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                     path=parsed.path,
                 )
                 return self.json_response({"ok": True, "data": bootstrap()})
+            if parsed.path == "/api/style-presets":
+                return self.json_response({"ok": True, "data": style_presets()})
             if parsed.path == "/api/runtime/media":
                 return self.json_response({"ok": True, "data": get_media_runtime_status()})
             if parsed.path == "/api/video-acceleration":

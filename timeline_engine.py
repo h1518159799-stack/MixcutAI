@@ -421,8 +421,13 @@ def title_horizontal_scale(text, font_size, width):
 
 
 def render_title_ass(title, video, duration, width, height, output_path):
+    from style_presets import get_title_render_overrides
+    overrides = get_title_render_overrides(title.get("title_style"), width, height, title)
+    if overrides:
+        title = {**title, **overrides}
     font = str(title.get("font") or "Microsoft YaHei")
-    size = max(12, int(float(title.get("font_size") or 118)))
+    size = max(1 if overrides else 12, int(float(title.get("font_size") or 118)))
+    bold = title.get("bold", -1) if overrides else -1
     primary = ass_color(title.get("color"), "#FFE67A")
     outline_color = ass_color(title.get("outline_color"), "#000000")
     shadow_color = ass_color(title.get("shadow_color"), "#F15A24")
@@ -451,8 +456,8 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Title,{font},{size},{primary},{primary},{outline_color},&H00000000,-1,0,0,0,100,100,0,0,1,{outline},0,{alignment},0,0,0,1
-Style: Shadow,{font},{size},{shadow_color},{shadow_color},{shadow_color},&H00000000,-1,0,0,0,100,100,0,0,1,0,0,{alignment},0,0,0,1
+Style: Title,{font},{size},{primary},{primary},{outline_color},&H00000000,{bold},0,0,0,100,100,0,0,1,{outline},0,{alignment},0,0,0,1
+Style: Shadow,{font},{size},{shadow_color},{shadow_color},{shadow_color},&H00000000,{bold},0,0,0,100,100,0,0,1,0,0,{alignment},0,0,0,1
 Style: Box,Arial,10,{background_color},{background_color},{background_color},{background_color},0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1
 
 [Events]
@@ -525,7 +530,12 @@ def render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, output_
     ])
     vf = ",".join(video_filters)
     if subtitle and subtitle.get("source"):
-        vf += f",ass='{ffmpeg_filter_path(subtitle['source'])}'"
+        from style_presets import restyle_subtitle_ass
+        subtitle_source = restyle_subtitle_ass(
+            subtitle["source"], Path(output_path).with_suffix(".subtitle.ass"),
+            timeline.get("subtitle_style"), width, height,
+        )
+        vf += f",ass='{ffmpeg_filter_path(subtitle_source)}'"
     if title:
         title_ass = render_title_ass(
             title, video, duration, width, height, Path(output_path).with_suffix(".title.ass")

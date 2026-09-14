@@ -509,6 +509,7 @@ def title_config_from_settings(values):
     return {
         "main": main,
         "sub": sub,
+        "title_style": values.get("title_style") or "legacy",
         "font": values.get("title_font") or "Microsoft YaHei",
         "font_dir": values.get("title_font_dir") or "",
         "font_size": float(values.get("title_font_size") or 118),
@@ -686,6 +687,9 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
         event("external_call_end", _perf_time.perf_counter() - _accel_started, call="hardware_encoder_details")
         event("timeline_build_end", 0.0)
     encoder = acceleration["selected_encoder"]
+    with connect() as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key='subtitle_style'").fetchone()
+    subtitle_style = row["value"] if row else "legacy"
     try:
         from generation_performance import set_encoding, set_hardware
         set_encoding(encoder)
@@ -735,6 +739,7 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
         end_hold_duration=end_hold_duration,
         inter_shot_safety=inter_shot_safety,
     )
+    timeline["subtitle_style"] = subtitle_style
     with connect() as conn:
         volume_row = conn.execute("SELECT value FROM app_settings WHERE key='voice_volume'").fetchone()
     voice_volume = float(volume_row["value"] or 1.0) if volume_row else 1.0
