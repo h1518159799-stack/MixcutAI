@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+import json
+import os
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -226,6 +229,56 @@ def test_cancelled_export_can_be_started_again(split_db, monkeypatch):
     result = service.start_export(1)
     assert result["status"] == "exporting"
     assert result["cancel_requested"] == 0
+
+
+def test_open_output_directory_is_non_blocking_and_logged(split_db, tmp_path, monkeypatch):
+    _, connect = split_db
+    output = tmp_path / "split output"
+    output.mkdir()
+    with connect() as conn:
+        conn.execute("UPDATE smart_split_jobs SET output_dir=?,status='completed' WHERE id=1", (str(output),))
+    launched = Mock()
+    monkeypatch.setattr(service.subprocess, "Popen", launched)
+    monkeypatch.setattr(service, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(service.os, "name", "nt")
+
+    result = service.open_output_directory(1)
+
+    assert result == {"opened": True, "path": str(output.resolve())}
+    command = launched.call_args.args[0]
+    assert command == ["explorer.exe", str(output.resolve())]
+    assert launched.call_args.kwargs["creationflags"] == getattr(service.subprocess, "CREATE_NO_WINDOW", 0)
+    record = json.loads((tmp_path / "logs" / "smart-split-open-folder.log").read_text(encoding="utf-8"))
+    assert record["event"] == "open_folder_called"
+    assert record["folder_path"] == str(output.resolve())
+    assert record["result"] == "opened"
+    assert record["exception"] == ""
+
+
+def test_open_output_directory_failure_is_logged(split_db, tmp_path, monkeypatch):
+    _, connect = split_db
+    output = tmp_path / "split output"
+    output.mkdir()
+    with connect() as conn:
+        conn.execute("UPDATE smart_split_jobs SET output_dir=?,status='completed' WHERE id=1", (str(output),))
+    monkeypatch.setattr(service, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(service.os, "name", "nt")
+    monkeypatch.setattr(service.subprocess, "Popen", Mock(side_effect=OSError("Explorer unavailable")))
+
+    with pytest.raises(service.SmartSplitError, match="无法打开输出目录"):
+        service.open_output_directory(1)
+
+    record = json.loads((tmp_path / "logs" / "smart-split-open-folder.log").read_text(encoding="utf-8"))
+    assert record["result"] == "failed"
+    assert "Explorer unavailable" in record["exception"]
+
+
+def test_smart_split_open_output_keeps_react_job_state():
+    source = (Path(__file__).resolve().parents[1] / "ui-commercial" / "src" / "SmartSplitPage.jsx").read_text(encoding="utf-8")
+    assert 'if(name==="open-output"){notify("已打开输出目录");return}setJob(result.job||result)' in source
+    assert "window.open" not in source
+    assert "window.location" not in source
+    assert "location.href" not in source
 
 
 def test_recovery_marks_interrupted_job_failed(split_db):

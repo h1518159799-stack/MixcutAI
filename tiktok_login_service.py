@@ -17,8 +17,13 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from browser_auth_service import _is_authenticated
-from browser_profile_service import ensure_profile, find_chromium
+from browser_profile_service import ensure_profile, find_system_browser
+
+# Compatibility name for older integrations/tests. TikTok login never uses
+# the bundled Chromium through this alias; it resolves only installed Chrome/Edge.
+find_chromium = find_system_browser
 from runtime_paths import LOG_DIR
+from subprocess_utils import background_process_kwargs
 
 
 TIKTOK_LOGIN_URLS = {
@@ -371,40 +376,19 @@ def _run_login(session: TikTokLoginSession) -> None:
 
 
 def launch_tiktok_login(account_id: int, profile_path: str, mode: str = "qr") -> dict[str, Any]:
-    try:
-        import playwright.sync_api  # noqa: F401
-    except ImportError as exc:
-        raise RuntimeError("Playwright未安装，请重新安装发布版") from exc
     profile = ensure_profile(profile_path)
-    browser = find_chromium()
+    browser = find_system_browser()
     selected_mode = normalize_login_mode(mode)
     with _LOCK:
-        running = _SESSIONS.get(account_id)
-        if running and running.thread and running.thread.is_alive():
-            running.requested_mode = selected_mode
-            running.message = "正在切换TikTok登录方式"
-            running.updated_at = time.time()
-            return running.public()
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        session = TikTokLoginSession(
-            account_id=account_id,
-            profile_path=str(profile),
-            browser_path=str(browser),
-            mode=selected_mode,
-            requested_mode=selected_mode,
-            log_path=str(_diag_dir(account_id) / f"login-{stamp}.jsonl"),
-            browser_version=_browser_version(browser),
-        )
-        session.thread = threading.Thread(
-            target=_run_login,
-            args=(session,),
-            name=f"tiktok-login-{account_id}",
-            daemon=True,
-        )
-        _SESSIONS[account_id] = session
-        _LAST_RESULTS.pop(account_id, None)
-        session.thread.start()
-        return session.public()
+        existing = _SESSIONS.get(account_id)
+        if existing and existing.thread and existing.thread.is_alive():
+            existing.requested_mode = selected_mode
+            return {"account_id": account_id, "status": "browser_open", "message": "TikTok登录浏览器已打开，请完成登录后点击检测。", "profile_path": str(profile), "browser": str(browser), "browser_version": _browser_version(browser)}
+    import subprocess
+    command = [str(browser), f"--user-data-dir={profile}", "--profile-directory=Default", "--no-first-run", "--no-default-browser-check", "--new-window", login_url_for_mode(selected_mode)]
+    process = subprocess.Popen(command, cwd=str(browser.parent), close_fds=True,
+                               **background_process_kwargs(command, "tiktok_login_browser"))
+    return {"account_id": account_id, "status": "browser_open", "message": "请在系统Chrome中完成TikTok登录，完成后返回软件点击检测登录状态。", "profile_path": str(profile), "browser": str(browser), "browser_version": _browser_version(browser), "pid": process.pid, "login_mode": selected_mode}
 
 
 def tiktok_login_status(account_id: int, account: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -447,7 +431,7 @@ def probe_tiktok_login(account_id: int, profile_path: str) -> dict[str, Any]:
         if running and running.thread and running.thread.is_alive():
             return running.public()
     profile = ensure_profile(profile_path)
-    browser = find_chromium()
+    browser = find_system_browser()
     diag = _diag_dir(account_id)
     result: dict[str, Any] = {
         "account_id": account_id,

@@ -122,6 +122,56 @@ class LicenseModuleTests(unittest.TestCase):
         self.assertFalse(state.valid)
         self.assertEqual(state.status, "offline_grace_expired")
 
+    def test_short_offline_tokens_are_signed_machine_bound_and_precise(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        for kind, duration in (("day1", timedelta(hours=24)), ("day7", timedelta(days=7))):
+            token = issue(MACHINE_A, kind, private_key_path=self.private_key_file)
+            payload = license_module.verify_signed_token(token)
+            self.assertEqual(payload["type"], kind)
+            self.assertIn("activated_at", payload)
+            expires = license_module._parse_utc(payload["expire_date"])
+            activated = license_module._parse_utc(payload["activated_at"])
+            self.assertEqual(expires - activated, duration)
+            self.assertLess(abs((activated - now).total_seconds()), 5)
+            self.license_file.unlink(missing_ok=True)
+            state = license_module.activate_license(token, MACHINE_A)
+            self.assertTrue(state.valid)
+            self.assertEqual(state.license_type, kind)
+            self.assertGreater(state.seconds_left, 0)
+            self.license_file.unlink(missing_ok=True)
+            with self.assertRaisesRegex(ValueError, "其他机器"):
+                license_module.activate_license(token, MACHINE_B)
+
+    def test_short_license_expires_at_exact_utc_instant(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        expiry = now + timedelta(minutes=30)
+        token = issue(MACHINE_A, "day1", expiry.isoformat().replace("+00:00", "Z"), self.private_key_file)
+        license_module.save_license_token(token)
+        before = license_module.check_license(MACHINE_A, current_time=expiry - timedelta(seconds=1), allow_online=False)
+        at_expiry = license_module.check_license(MACHINE_A, current_time=expiry, allow_online=False)
+        self.assertTrue(before.valid)
+        self.assertFalse(at_expiry.valid)
+        self.assertEqual(at_expiry.status, "expired")
+
+    def test_tampered_short_tokens_are_rejected(self):
+        for kind in ("day1", "day7"):
+            token = issue(MACHINE_A, kind, private_key_path=self.private_key_file)
+            prefix, payload, signature = token.split(".")
+            raw = bytearray(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            raw[-2] ^= 1
+            altered_payload = base64.urlsafe_b64encode(bytes(raw)).decode().rstrip("=")
+            with self.assertRaisesRegex(ValueError, "签名"):
+                license_module.activate_license(f"{prefix}.{altered_payload}.{signature}", MACHINE_A)
+
+    def test_legacy_types_remain_supported(self):
+        future = (datetime.now(timezone.utc).date() + timedelta(days=20)).isoformat()
+        for kind, expiry in (("month", future), ("year", future), ("permanent", "")):
+            self.license_file.unlink(missing_ok=True)
+            token = issue(MACHINE_A, kind, expiry, self.private_key_file)
+            state = license_module.activate_license(token, MACHINE_A)
+            self.assertTrue(state.valid)
+            self.assertEqual(state.license_type, kind)
+
 
 if __name__ == "__main__":
     unittest.main()

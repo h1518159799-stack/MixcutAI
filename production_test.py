@@ -10,6 +10,7 @@ from subtitle_service import generate_ass_for_shot
 from video_engine import generate_video
 from video_scan import make_thumbnail, probe_video, quick_hash
 from runtime_paths import get_ffmpeg_path, get_ffprobe_path
+from subprocess_utils import background_process_kwargs
 
 TEST_ROOT = DATA_DIR / "production_tests"
 
@@ -94,7 +95,8 @@ def get_setting(key):
 
 
 def run_cmd(cmd, timeout=120):
-    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=timeout)
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=timeout,
+                       **background_process_kwargs(cmd, "production_test"))
     if p.returncode != 0:
         raise RuntimeError((p.stderr or p.stdout or f"command failed: {cmd}").strip()[-2000:])
     return p.stdout.strip()

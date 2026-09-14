@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>MixcutAI 授权中心</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='admin.css') }}">
+  <script defer src="{{ url_for('static', filename='admin.js') }}"></script>
 </head>
 <body>
   <header class="topbar">
@@ -28,6 +29,8 @@
         <article><span>客户总数</span><strong>{{ counts.customers }}</strong></article>
         <article><span>授权总数</span><strong>{{ counts.licenses }}</strong></article>
         <article><span>有效授权</span><strong>{{ counts.active }}</strong></article>
+        <article><span>到期授权</span><strong>{{ counts.expired }}</strong></article>
+        <article><span>冻结授权</span><strong>{{ counts.frozen }}</strong></article>
         <article><span>绑定设备</span><strong>{{ counts.devices }}</strong></article>
       </div>
     </section>
@@ -37,7 +40,7 @@
       <form method="post" action="{{ url_for('admin_license_generate') }}" class="inline-form">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <label>客户<select name="customer_id"><option value="">未指定客户</option>{% for c in customers %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></label>
-        <label>授权类型<select name="type"><option value="month">月卡</option><option value="year">年卡</option><option value="permanent">永久</option></select></label>
+        <label>授权类型<select name="type"><option value="day1">1天卡</option><option value="day7">7天卡</option><option value="month">月卡</option><option value="year">年卡</option><option value="permanent">永久卡</option></select></label>
         <label>设备数<input type="number" name="max_devices" min="1" max="20" value="1"></label>
         <label>数量<input type="number" name="count" min="1" max="100" value="1"></label>
         <button class="primary" type="submit">生成卡密</button>
@@ -46,8 +49,8 @@
       <div class="table-wrap">
         <table><thead><tr><th>尾号</th><th>客户</th><th>类型</th><th>设备</th><th>到期时间</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>{% for l in licenses %}<tr>
-          <td><code>***{{ l.key_hint }}</code></td><td>{{ l.customer_name or '—' }}</td><td>{{ {'month':'月卡','year':'年卡','permanent':'永久'}.get(l.type,l.type) }}</td>
-          <td>{{ l.active_devices }}/{{ l.max_devices }}</td><td>{{ l.expire_date or '永久' }}</td><td><span class="badge {{ l.status }}">{{ l.status }}</span></td>
+          <td><code>***{{ l.key_hint }}</code></td><td>{{ l.customer_name or '—' }}</td><td>{{ license_type_label(l.type) }}</td>
+          <td>{{ l.active_devices }}/{{ l.max_devices }}</td><td>{% if l.type in ('day1','day7') and l.expire_date %}<time data-local-time="{{ l.expire_date }}">{{ l.expire_date }}</time>{% else %}{{ l.expire_date or '永久' }}{% endif %}</td><td><span class="badge {{ l.status }}">{{ l.status }}</span></td>
           <td><form method="post" action="{{ url_for('admin_license_status', license_id=l.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">{% if l.status == 'frozen' %}<input type="hidden" name="status" value="active"><button class="small">解冻</button>{% else %}<input type="hidden" name="status" value="frozen"><button class="small danger">冻结</button>{% endif %}</form></td>
         </tr>{% else %}<tr><td colspan="7" class="empty">暂无授权</td></tr>{% endfor %}</tbody></table>
       </div>
@@ -79,4 +82,3 @@
   </main>
 </body>
 </html>
-

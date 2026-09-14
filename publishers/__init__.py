@@ -4,6 +4,8 @@ from .instagram import InstagramPublisher
 from .tiktok import TikTokPublisher
 from .youtube import YouTubePublisher
 from .domestic_guarded import GuardedDomesticBrowserPublisher
+from .postflow_adapter import WechatChannelsPostFlowPublisher
+import os
 
 
 _PUBLISHERS = {
@@ -14,7 +16,12 @@ _PUBLISHERS = {
     "douyin": BrowserPublisher("douyin"),
     "xiaohongshu": GuardedDomesticBrowserPublisher("xiaohongshu"),
     "kuaishou": GuardedDomesticBrowserPublisher("kuaishou"),
-    "wechat_channels": GuardedDomesticBrowserPublisher("wechat_channels"),
+    # PostFlow is the production video-channel provider.  Keep an explicit
+    # legacy opt-out for rollback/debugging, but make the normal default
+    # independent of process environment configuration.
+    "wechat_channels": (GuardedDomesticBrowserPublisher("wechat_channels")
+                        if os.environ.get("WECHAT_CHANNELS_PROVIDER", "postflow").strip().lower() == "legacy"
+                        else WechatChannelsPostFlowPublisher()),
     "bilibili": GuardedDomesticBrowserPublisher("bilibili"),
 }
 

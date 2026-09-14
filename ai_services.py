@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import subprocess
 import time
 import urllib.error
@@ -9,6 +10,8 @@ import urllib.request
 import wave
 from array import array
 from pathlib import Path
+from typing import Callable
+from urllib.parse import urlparse
 
 from db import APP_DIR, VOICE_DIR, connect
 from config_secret_store import runtime_service_config
@@ -20,6 +23,25 @@ from runtime_paths import MediaRuntimeError, get_ffmpeg_path
 
 class ServiceError(RuntimeError):
     pass
+
+
+class AIRequestError(ServiceError):
+    """Normalized text-AI failure safe for task logs and UI."""
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False, status_code: int = 0):
+        super().__init__(message)
+        self.code = str(code or "AI_PROVIDER_ERROR")
+        self.retryable = bool(retryable)
+        self.status_code = int(status_code or 0)
+
+
+AI_RETRY_DELAYS = (2.0, 5.0)
+AIRetryCallback = Callable[[dict], None]
+
+
+def _emit_ai_retry(callback: AIRetryCallback | None, **event) -> None:
+    if callback is not None:
+        callback(dict(event))
 
 
 def get_active_text_ai_config() -> dict:
@@ -51,6 +73,74 @@ def _endpoint(base_url: str, suffix: str) -> str:
     return base if base.endswith(suffix) else base + suffix
 
 
+def normalize_ai_base_url(base_url: str) -> str:
+    """Normalize an OpenAI-compatible root without inventing path segments."""
+    value = str(base_url or "").strip().rstrip("/")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise AIRequestError("AI_CONNECTION_FAILED", "AI 接口地址格式不正确。")
+    return value
+
+
+def _test_error(code: str, base_url: str, model: str = "", status_code: int = 0) -> AIRequestError:
+    messages = {
+        "AI_CONNECTION_FAILED": f"无法连接 AI 服务：{base_url}。请确认接口地址正确，或本地 AI 服务已经启动。",
+        "AI_TIMEOUT": "AI 服务响应超时，请检查服务状态或稍后重试。",
+        "AI_AUTH_FAILED": "API Key 无效或已失效，请重新配置。",
+        "AI_MODEL_NOT_FOUND": f"接口连接成功，但当前模型不可用：{model}。请检查模型名称。",
+        "AI_INVALID_RESPONSE": "AI 接口返回内容格式异常。",
+        "AI_PROVIDER_ERROR": f"AI 服务返回 HTTP {status_code}。" if status_code else "AI 服务返回异常。",
+        "AI_TEST_CANCELLED": "连接测试已取消。",
+    }
+    return AIRequestError(code, messages.get(code, "AI 服务测试失败。"), status_code=status_code)
+
+
+def _connection_preflight(base_url: str, timeout: float = 8.0) -> None:
+    parsed = urlparse(base_url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((parsed.hostname, port), timeout=max(1.0, min(10.0, float(timeout)))):
+            return
+    except (OSError, TimeoutError, socket.timeout) as exc:
+        raise _test_error("AI_CONNECTION_FAILED", base_url) from exc
+
+
+def _test_json_request(url: str, api_key: str, timeout: int, *, payload: dict | None = None) -> dict:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key.strip()
+    body = None
+    method = "GET"
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        method = "POST"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=max(5, int(timeout or 60))) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                return json.loads(raw or "{}")
+            except json.JSONDecodeError as exc:
+                raise _test_error("AI_INVALID_RESPONSE", url) from exc
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000].lower()
+        exc.close()
+        if exc.code in {401, 403} or "invalid_api_key" in detail:
+            raise _test_error("AI_AUTH_FAILED", url, status_code=exc.code) from exc
+        if payload is not None and exc.code in {400, 404} and any(token in detail for token in ("model", "not found", "does not exist")):
+            raise _test_error("AI_MODEL_NOT_FOUND", url, status_code=exc.code) from exc
+        raise _test_error("AI_PROVIDER_ERROR", url, status_code=exc.code) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise _test_error("AI_TIMEOUT", url) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)) or "timed out" in str(exc.reason).lower():
+            raise _test_error("AI_TIMEOUT", url) from exc
+        raise _test_error("AI_CONNECTION_FAILED", url) from exc
+    except (ConnectionError, OSError) as exc:
+        raise _test_error("AI_CONNECTION_FAILED", url) from exc
+
+
 def _json_request(url: str, payload: dict, api_key: str, timeout: int) -> dict:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -63,14 +153,34 @@ def _json_request(url: str, payload: dict, api_key: str, timeout: int) -> dict:
             return json.loads(raw or "{}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise ServiceError(f"HTTP {exc.code}: {detail or exc.reason}") from exc
+        exc.close()
+        if exc.code in {401, 403}:
+            raise AIRequestError("AI_AUTH_FAILED", "AI\u914d\u7f6e\u65e0\u6548\uff0c\u8bf7\u68c0\u67e5\u7cfb\u7edf\u8bbe\u7f6e\u4e2d\u7684AI\u670d\u52a1\u914d\u7f6e\u3002", status_code=exc.code) from exc
+        if exc.code == 429:
+            raise AIRequestError("AI_RATE_LIMITED", "AI\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41\uff0c\u5c06\u81ea\u52a8\u91cd\u8bd5\u3002", retryable=True, status_code=exc.code) from exc
+        if exc.code in {502, 503, 504}:
+            raise AIRequestError("AI_PROVIDER_ERROR", f"AI\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528\uff08HTTP {exc.code}\uff09\u3002", retryable=True, status_code=exc.code) from exc
+        raise AIRequestError("AI_PROVIDER_ERROR", f"AI\u670d\u52a1\u8fd4\u56de HTTP {exc.code}\u3002", status_code=exc.code) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise AIRequestError("AI_TIMEOUT", "AI\u6587\u6848\u751f\u6210\u8d85\u65f6\u3002", retryable=True) from exc
     except urllib.error.URLError as exc:
-        raise ServiceError(f"连接失败：{exc.reason}") from exc
+        reason = str(exc.reason or "")
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)) or "timed out" in reason.lower():
+            raise AIRequestError("AI_TIMEOUT", "AI\u6587\u6848\u751f\u6210\u8d85\u65f6\u3002", retryable=True) from exc
+        raise AIRequestError("AI_NETWORK_ERROR", "AI\u670d\u52a1\u7f51\u7edc\u8fde\u63a5\u5931\u8d25\u3002", retryable=True) from exc
+    except ConnectionError as exc:
+        raise AIRequestError("AI_NETWORK_ERROR", "AI\u670d\u52a1\u7f51\u7edc\u8fde\u63a5\u5931\u8d25\u3002", retryable=True) from exc
+    except OSError as exc:
+        # ``urllib`` normally wraps socket failures in ``URLError``, but some
+        # Windows socket/provider combinations leak a raw ``OSError``.  Keep it
+        # inside the same bounded retry path instead of killing the worker.
+        raise AIRequestError("AI_NETWORK_ERROR", "AI\u670d\u52a1\u7f51\u7edc\u8fde\u63a5\u5931\u8d25\u3002", retryable=True) from exc
     except json.JSONDecodeError as exc:
-        raise ServiceError("服务返回的不是有效 JSON") from exc
+        raise AIRequestError("AI_INVALID_RESPONSE", "AI\u8fd4\u56de\u5185\u5bb9\u683c\u5f0f\u5f02\u5e38\u3002") from exc
 
 
-def chat_completion(config: dict, messages: list[dict], temperature: float = 0.5) -> str:
+def chat_completion(config: dict, messages: list[dict], temperature: float = 0.5, *,
+                    attempts: int = 1, retry_callback: AIRetryCallback | None = None) -> str:
     if not config.get("is_enabled", 1):
         raise ServiceError("AI 服务已停用")
     provider = config.get("provider") or "openai_compatible"
@@ -79,24 +189,111 @@ def chat_completion(config: dict, messages: list[dict], temperature: float = 0.5
     model = str(config.get("model") or "").strip()
     if not model:
         raise ServiceError("AI 模型不能为空")
-    data = _json_request(
-        _endpoint(config.get("base_url", ""), "/chat/completions"),
-        {"model": model, "messages": messages, "temperature": temperature, "stream": False},
-        config.get("api_key", ""),
-        config.get("timeout_seconds", 60),
-    )
+    total_attempts = max(1, min(3, int(attempts or 1)))
+    data = None
+    for attempt in range(1, total_attempts + 1):
+        _emit_ai_retry(retry_callback, phase="attempt", attempt=attempt, total=total_attempts)
+        try:
+            data = _json_request(
+                _endpoint(config.get("base_url", ""), "/chat/completions"),
+                {"model": model, "messages": messages, "temperature": temperature, "stream": False},
+                config.get("api_key", ""),
+                config.get("timeout_seconds", 60),
+            )
+            _emit_ai_retry(retry_callback, phase="success", attempt=attempt, total=total_attempts)
+            break
+        except AIRequestError as exc:
+            if not exc.retryable or attempt >= total_attempts:
+                _emit_ai_retry(retry_callback, phase="failed", attempt=attempt, total=total_attempts,
+                               code=exc.code, message=str(exc), retryable=exc.retryable)
+                raise
+            delay = AI_RETRY_DELAYS[min(attempt - 1, len(AI_RETRY_DELAYS) - 1)]
+            _emit_ai_retry(retry_callback, phase="retry", attempt=attempt, total=total_attempts,
+                           code=exc.code, message=str(exc), delay=delay)
+            time.sleep(delay)
+    assert data is not None
     try:
         content = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ServiceError("AI 服务未返回 choices[0].message.content") from exc
+        raise AIRequestError("AI_INVALID_RESPONSE", "AI\u8fd4\u56de\u5185\u5bb9\u683c\u5f0f\u5f02\u5e38\u3002") from exc
     content = str(content or "").strip()
     if not content:
-        raise ServiceError("AI 服务返回了空文案")
+        raise AIRequestError("AI_INVALID_RESPONSE", "AI\u8fd4\u56de\u4e86\u7a7a\u6587\u6848\u3002")
     return content
 
 
-def test_ai_service(config: dict) -> str:
-    return chat_completion(config, [{"role": "user", "content": "只回复：连接成功"}], temperature=0)
+def test_ai_service(config: dict) -> dict:
+    """Test current (possibly unsaved) form values with a low-cost request."""
+    if not config.get("is_enabled", 1):
+        raise AIRequestError("AI_PROVIDER_ERROR", "AI 服务已停用，请先启用此服务。")
+    provider = str(config.get("provider") or "openai_compatible")
+    if provider != "openai_compatible":
+        raise AIRequestError("AI_PROVIDER_ERROR", f"暂不支持的 AI 服务类型：{provider}")
+    base_url = normalize_ai_base_url(config.get("base_url", ""))
+    api_key = str(config.get("api_key") or "").strip()
+    model = str(config.get("model") or "").strip()
+    if not api_key:
+        raise AIRequestError("AI_AUTH_FAILED", "尚未配置 API Key。")
+    if not model:
+        raise AIRequestError("AI_MODEL_NOT_FOUND", "AI 模型不能为空。")
+    timeout = max(5, int(config.get("timeout_seconds") or 60))
+    started = time.perf_counter()
+    _connection_preflight(base_url, min(8, timeout))
+    model_validation = "通过"
+    method = "models+chat"
+    try:
+        data = _test_json_request(_endpoint(base_url, "/models"), api_key, timeout)
+        model_ids = {
+            str(item.get("id") or "") for item in (data.get("data") or [])
+            if isinstance(item, dict)
+        }
+        if model_ids and model not in model_ids:
+            raise _test_error("AI_MODEL_NOT_FOUND", base_url, model)
+        if not isinstance(data, dict):
+            raise _test_error("AI_INVALID_RESPONSE", base_url)
+    except AIRequestError as exc:
+        # Some compatible providers intentionally omit /models. Only endpoint
+        # absence falls back; auth, timeout and server errors remain explicit.
+        if exc.code != "AI_PROVIDER_ERROR" or exc.status_code not in {404, 405}:
+            if exc.code == "AI_MODEL_NOT_FOUND":
+                raise _test_error("AI_MODEL_NOT_FOUND", base_url, model, exc.status_code) from exc
+            raise
+        method = "chat"
+        model_validation = "通过（最小请求）"
+    # A models response proves authentication and discovery, but not that the
+    # endpoint can actually generate text. Always finish with a tiny request so
+    # the UI never reports a false success while real rewrites would time out.
+    data = _test_json_request(
+        _endpoint(base_url, "/chat/completions"), api_key, timeout,
+        payload={
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a connection test."},
+                {"role": "user", "content": "Reply with OK."},
+            ],
+            "temperature": 0,
+            "max_tokens": 4,
+            "stream": False,
+        },
+    )
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc2:
+        raise _test_error("AI_INVALID_RESPONSE", base_url) from exc2
+    if not str(content or "").strip():
+        raise _test_error("AI_INVALID_RESPONSE", base_url)
+    latency_ms = max(1, round((time.perf_counter() - started) * 1000))
+    return {
+        "message": "连接成功，可以正常使用当前 AI 服务。",
+        "service": str(config.get("name") or "AI 服务"),
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "latency_ms": latency_ms,
+        "status": "available",
+        "model_validation": model_validation,
+        "test_method": method,
+    }
 
 
 def _ffmpeg_path(settings: dict) -> str:
@@ -108,7 +305,8 @@ def _ffmpeg_path(settings: dict) -> str:
 
 def _convert_to_wav(source: Path, output: Path, settings: dict):
     command = [_ffmpeg_path(settings), "-y", "-i", str(source), "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(output)]
-    completed = subprocess.run(command, capture_output=True, timeout=180, **background_process_kwargs())
+    completed = subprocess.run(command, capture_output=True, timeout=180,
+                               **background_process_kwargs(command, "tts_audio_convert"))
     if completed.returncode != 0 or not output.exists():
         raise ServiceError("FFmpeg 无法转换外部 TTS 音频")
 
@@ -150,6 +348,13 @@ def _synthesize_edge_tts(text: str, voice_code: str, rate: int, output_mp3: Path
 
 
 def synthesize_tts(config: dict, voice: dict, text: str, shot_id: int, settings: dict, speed: float = 1.0) -> tuple[str, float]:
+    import time as _perf_time
+    _real_tts_started = _perf_time.perf_counter()
+    try:
+        from generation_performance import event
+        event("tts_real_start", 0.0, provider=str(config.get("provider") or ""), shot_id=str(shot_id))
+    except ImportError:
+        event = None
     text = str(text or "").strip()
     if not text:
         raise ServiceError("文案为空，无法生成语音")
@@ -245,6 +450,8 @@ def synthesize_tts(config: dict, voice: dict, text: str, shot_id: int, settings:
     duration = audio_duration(str(output_wav))
     if duration <= 0:
         raise ServiceError("生成的语音无法检测真实时长")
+    if event:
+        event("tts_real_end", _perf_time.perf_counter() - _real_tts_started, shot_id=str(shot_id))
     return str(output_wav), duration
 
 

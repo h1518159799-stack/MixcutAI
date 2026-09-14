@@ -38,7 +38,8 @@ def audio_probe(path, ffprobe_path=""):
         str(path),
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20, **background_process_kwargs())
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore", timeout=20,
+                           **background_process_kwargs(cmd, "bgm_probe"))
         if p.returncode == 0:
             data = json.loads(p.stdout or "{}")
             result["duration"] = float((data.get("format") or {}).get("duration") or 0)

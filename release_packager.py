@@ -79,21 +79,24 @@ def verify_archive(target_value: str) -> None:
         bad_members = archive.testzip()
     if bad_members:
         raise SystemExit(f"release ZIP CRC check failed: {bad_members}")
+    if 'runtime/postflow/postflow_confirmation.py' not in names:
+        raise SystemExit('POSTFLOW_CONFIRMATION_MISSING')
     unexpected = [
         name
         for name in names
         if name not in ALLOWED_ROOT
-        and not name.startswith("browser/chromium/")
+        and not (name.startswith("browser/chromium/") or name.startswith("runtime/browser/chromium/"))
         and not name.startswith("runtime/ffmpeg/")
+        and not name.startswith("runtime/postflow/")
     ]
     if unexpected or not ALLOWED_ROOT.issubset(names):
         raise SystemExit(f"user package allowlist mismatch: {unexpected}")
-    if "browser/chromium/chrome.exe" not in names:
+    if "browser/chromium/chrome.exe" not in names and "runtime/browser/chromium/chrome.exe" not in names:
         raise SystemExit("bundled Chromium executable missing")
     for binary in ("runtime/ffmpeg/bin/ffmpeg.exe", "runtime/ffmpeg/bin/ffprobe.exe"):
         if binary not in names:
             raise SystemExit(f"bundled media runtime missing: {binary}")
-    forbidden = [name for name in names if any(mark in name.lower() for mark in FORBIDDEN_MARKERS)]
+    forbidden = [name for name in names if not name.startswith("runtime/postflow/") and any(mark in name.lower() for mark in FORBIDDEN_MARKERS)]
     if forbidden:
         raise SystemExit(f"forbidden user package entries: {forbidden}")
     print(f"PACKAGE_ALLOWLIST_OK {len(names)} files; bundled Chromium present; UTF-8 names preserved")

@@ -16,7 +16,8 @@ from cryptography.hazmat.primitives import serialization
 
 PRODUCT_ID = "mixcut-ai-windows"
 TOKEN_PREFIX = "MXLIC1"
-VALID_TYPES = ("month", "year", "permanent")
+VALID_TYPES = ("day1", "day7", "month", "year", "permanent")
+SHORT_TERM_DAYS = {"day1": 1, "day7": 7}
 ROOT = Path(__file__).resolve().parent
 DEFAULT_PRIVATE_KEY = Path(os.environ.get("MIXCUT_LICENSE_PRIVATE_KEY", ROOT / "keys" / "license_private_key.pem"))
 
@@ -34,11 +35,18 @@ def issue(machine_id: str, license_type: str, expire_date: str = "", private_key
         raise ValueError("unsupported license type")
     if not machine_id.startswith("MX-"):
         raise ValueError("machine id format is invalid")
+    activated = datetime.now(timezone.utc).replace(microsecond=0)
     today = date.today()
     if license_type != "permanent":
         if not expire_date:
-            expire_date = (today + timedelta(days=365 if license_type == "year" else 30)).isoformat()
-        date.fromisoformat(expire_date)
+            if license_type in SHORT_TERM_DAYS:
+                expire_date = (activated + timedelta(days=SHORT_TERM_DAYS[license_type])).isoformat().replace("+00:00", "Z")
+            else:
+                expire_date = (today + timedelta(days=365 if license_type == "year" else 30)).isoformat()
+        if license_type in SHORT_TERM_DAYS:
+            datetime.fromisoformat(expire_date.replace("Z", "+00:00"))
+        else:
+            date.fromisoformat(expire_date)
     else:
         expire_date = ""
     private_key = serialization.load_pem_private_key(private_key_path.read_bytes(), password=None)
@@ -48,7 +56,8 @@ def issue(machine_id: str, license_type: str, expire_date: str = "", private_key
         "product_id": PRODUCT_ID,
         "type": license_type,
         "machine_id": machine_id,
-        "issued_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "issued_at": activated.isoformat().replace("+00:00", "Z"),
+        "activated_at": activated.isoformat().replace("+00:00", "Z"),
         "expire_date": expire_date,
         "nonce": secrets.token_urlsafe(18),
         "max_devices": 1,

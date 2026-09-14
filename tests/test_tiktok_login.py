@@ -7,6 +7,7 @@ import browser_profile_service
 import commercial_api
 import db
 import tiktok_login_service as tiktok
+from publishers.browser_publisher import BrowserPublisher
 
 
 class TikTokLoginTests(unittest.TestCase):
@@ -80,6 +81,26 @@ class TikTokLoginTests(unittest.TestCase):
         self.assertNotEqual(first["browser_profile_path"], second["browser_profile_path"])
         self.assertTrue(Path(first["browser_profile_path"]).is_dir())
         self.assertTrue(Path(second["browser_profile_path"]).is_dir())
+
+    def test_tiktok_profiles_use_account_ids_outside_temp(self):
+        _platform, account = self._account("TikTok稳定环境")
+        path = Path(account["browser_profile_path"])
+        self.assertEqual(path.name, str(account["id"]))
+        self.assertEqual(path.parent.name, "tiktok")
+        self.assertEqual(path.parts[-3:-1], ("browser_profiles", "tiktok"))
+
+    def test_system_browser_prefers_installed_chrome_then_edge(self):
+        chrome = Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        edge = Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe")
+        with patch.object(Path, "is_file", autospec=True, side_effect=lambda item: item == chrome):
+            self.assertEqual(browser_profile_service.find_system_browser(), chrome)
+        with patch.object(Path, "is_file", autospec=True, side_effect=lambda item: item == edge):
+            self.assertEqual(browser_profile_service.find_system_browser(), edge)
+
+    def test_tiktok_publish_adapter_uses_system_browser_selector(self):
+        source = Path(BrowserPublisher.publish.__code__.co_filename).read_text(encoding="utf-8")
+        self.assertIn("find_system_browser() if self.platform_code == \"tiktok\"", source)
+        self.assertIn("str(profile)", source)
 
     def test_running_session_can_switch_login_mode_without_second_browser(self):
         _platform, account = self._account()

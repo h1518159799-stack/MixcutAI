@@ -18,6 +18,7 @@ import socket
 import tempfile
 import urllib.error
 import urllib.request
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -31,9 +32,11 @@ from runtime_paths import CONFIG_DIR, DATA_DIR
 
 
 PRODUCT_ID = "mixcut-ai-windows"
-APP_VERSION = "1.3.12"
+APP_VERSION = "1.3.14"
 TOKEN_PREFIX = "MXLIC1"
-VALID_TYPES = {"month", "year", "permanent"}
+VALID_TYPES = {"day1", "day7", "month", "year", "permanent"}
+SHORT_TERM_TYPES = {"day1", "day7"}
+TYPE_LABELS = {"day1": "1天卡", "day7": "7天卡", "month": "月卡", "year": "年卡", "permanent": "永久卡"}
 PUBLIC_KEY_B64 = "FS/YNzoWyelZRmfTJq7yZxFYnsjY8mlMha6XHofb4Qk="
 LICENSE_FILE = DATA_DIR / "license.dat"
 CLOCK_FILE = DATA_DIR / "license_clock.json"
@@ -50,6 +53,20 @@ def _iso_utc(value: datetime) -> str:
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _remaining_message(license_type: str, seconds_left: int | None) -> str:
+    if license_type == "permanent":
+        return "永久授权"
+    seconds = max(0, int(seconds_left or 0))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{TYPE_LABELS.get(license_type, '授权')}剩余 {days}天{hours}小时"
+    if hours:
+        return f"{TYPE_LABELS.get(license_type, '授权')}剩余 {hours}小时{minutes}分钟"
+    return f"{TYPE_LABELS.get(license_type, '授权')}剩余 {minutes}分钟"
 
 
 def _b64url_encode(value: bytes) -> str:
@@ -146,6 +163,9 @@ def _settings() -> dict[str, str]:
     for key, value in file_values.items():
         if key not in values or values[key] in (None, ""):
             values[key] = str(value)
+    override = str(os.environ.get("MIXCUT_LICENSE_BASE_URL") or "").strip()
+    if override:
+        values["license_server_url"] = override
     return values
 
 
@@ -261,6 +281,7 @@ class LicenseState:
     expire_date: str = ""
     machine_id: str = ""
     days_left: int | None = None
+    seconds_left: int | None = None
 
 
 def _cache_payload(payload: dict[str, Any], token: str, status: str = "active", server_checked: bool = False) -> None:
@@ -312,15 +333,26 @@ def check_license(current_machine_id: str | None = None, current_time: datetime 
         return LicenseState(False, "clock_rollback", "检测到系统时间回拨，请联网重新验证", license_id, license_type, expire_date, current_machine_id)
 
     days_left: int | None = None
+    seconds_left: int | None = None
     if license_type != "permanent":
         try:
-            expiry = date.fromisoformat(expire_date)
+            if license_type in SHORT_TERM_TYPES:
+                expiry_time = _parse_utc(expire_date)
+                seconds_left = math.ceil((expiry_time - current_time).total_seconds())
+                days_left = max(0, math.ceil(seconds_left / 86400))
+                expired = current_time >= expiry_time
+            else:
+                expiry = date.fromisoformat(expire_date)
+                days_left = (expiry - current_time.date()).days
+                seconds_left = max(0, days_left * 86400)
+                expired = days_left < 0
         except ValueError:
             return LicenseState(False, "invalid", "签名授权缺少有效期", license_id, license_type, expire_date, current_machine_id)
-        days_left = (expiry - current_time.date()).days
-        if days_left < 0:
+        if expired:
             _cache_payload(payload, token, "expired")
-            return LicenseState(False, "expired", "授权已到期", license_id, license_type, expire_date, current_machine_id, days_left)
+            label = TYPE_LABELS.get(license_type, "授权")
+            message = f"你的{label.replace('卡', '体验授权')}已到期，请联系软件提供方续费。" if license_type in SHORT_TERM_TYPES else "授权已到期"
+            return LicenseState(False, "expired", message, license_id, license_type, expire_date, current_machine_id, days_left, 0)
 
     cfg = _settings()
     server_url = str(cfg.get("license_server_url") or "").strip()
@@ -351,8 +383,8 @@ def check_license(current_machine_id: str | None = None, current_time: datetime 
         clock_state["last_seen_utc"] = _iso_utc(current_time)
     _write_clock_state(clock_state)
     _cache_payload(payload, token, "active", server_checked)
-    message = "永久授权" if license_type == "permanent" else f"授权剩余 {days_left} 天"
-    return LicenseState(True, "active", message, license_id, license_type, expire_date, current_machine_id, days_left)
+    message = _remaining_message(license_type, seconds_left)
+    return LicenseState(True, "active", message, license_id, license_type, expire_date, current_machine_id, days_left, seconds_left)
 
 
 def activate_license(key_code: str, current_machine_id: str | None = None) -> LicenseState:
@@ -409,7 +441,5 @@ def license_summary() -> dict[str, Any]:
     state = check_license()
     return {"valid": state.valid, "status": state.status, "message": state.message,
             "type": state.license_type, "expire_date": state.expire_date,
-            "machine_id": state.machine_id, "days_left": state.days_left}
-
-
-
+            "machine_id": state.machine_id, "days_left": state.days_left,
+            "seconds_left": state.seconds_left, "type_label": TYPE_LABELS.get(state.license_type, state.license_type)}

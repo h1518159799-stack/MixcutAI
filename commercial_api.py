@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import traceback
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler
 from pathlib import Path
@@ -25,14 +26,18 @@ from bgm_service import scan_bgm_folder
 from sfx_service import scan_sfx_folder
 from subtitle_service import generate_ass_for_shot, generate_ass_from_segments, split_text, subtitle_signature
 from tts_service import audio_duration, synthesize_windows_tts
-from video_engine import find_ffmpeg, generate_video, title_config_from_settings
+from video_engine import find_ffmpeg, generate_video, title_config_from_settings, video_acceleration_status
 from timeline_engine import ffmpeg_filter_path, render_title_ass
-from video_scan import make_thumbnail, make_thumbnail_with_status, probe_video, quick_hash, scan_video_files
-from ai_services import concatenate_tts_wavs, chat_completion, synthesize_tts, test_ai_service, test_tts_service
+from video_scan import VIDEO_EXTS, make_thumbnail, make_thumbnail_with_status, probe_video, quick_hash, scan_video_files
+from ai_services import (
+    AIRequestError, ServiceError, concatenate_tts_wavs, chat_completion,
+    synthesize_tts, test_ai_service, test_tts_service,
+)
 from runtime_paths import RESOURCE_DIR, get_media_runtime_status
 from subprocess_utils import background_process_kwargs
 from batch_service import BATCH_QUEUE, create_batch_task, recover_and_enqueue, sync_batch
-from update_service import UpdateError, UpdateManifest, check_for_update, configured_manifest_url, current_version, stage_and_launch
+from shared.update_manifest import UpdateManifest
+from update_service import UpdateError, check_for_update, configured_manifest_url, current_version, stage_and_launch
 from browser_profile_service import (
     detect_login_status,
     ensure_profile,
@@ -74,7 +79,7 @@ from ai_publish_service import PublishAIError, generate_publish_content
 from publish_metadata_service import attach_and_schedule, save_draft_field
 from generation_success_service import repair_missing_publish_records
 from cover_service import normalize_cover_path
-from script_segmentation import AI_SEGMENTATION_INSTRUCTION, smart_segment_text
+from script_segmentation import DEFAULT_REWRITE_PROMPT, AI_SEGMENTATION_INSTRUCTION, smart_segment_text
 from language_service import LANGUAGE_VOICE_PREFIXES, contains_cjk, detect_text_language, voice_matches_language
 from voice_clone_service import clone_minimax_voice
 from smart_split_api import smart_split_get, smart_split_post
@@ -87,10 +92,13 @@ from task_runtime import (
     ACTIVE_TASK_STATUSES, GENERATION_QUEUE, MAX_GENERATION_CONCURRENCY,
     generation_worker_snapshot, append_generation_worker_log,
 )
+from material_matcher import load_material_candidates, material_pool_diagnostics, select_material
+from startup_diagnostics import startup_log
 
 
 MEDIA_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".mkv", ".m4v", ".avi", ".webm", ".wmv", ".mpeg", ".mpg", ".wav", ".mp3", ".m4a", ".ass", ".srt"}
 GROUP_BATCH_LOCK = threading.Lock()
+BAILIAN_API_KEY_URL = "https://bailian.console.aliyun.com/?tab=model#/api-key"
 GENERATION_START_LOCK = threading.RLock()
 MATERIAL_SCAN_LOCK = threading.Lock()
 RECENT_COMPLETED_LIMIT = 10
@@ -103,6 +111,8 @@ GENERATION_WATCHDOG_INTERVAL_SECONDS = 5.0
 _GENERATION_WATCHDOG_LOCK = threading.Lock()
 _GENERATION_WATCHDOG_THREAD: threading.Thread | None = None
 _GENERATION_WATCHDOG_STOP = threading.Event()
+FRONTEND_CONNECTED_EVENT = threading.Event()
+UPDATE_SHUTDOWN_EVENT = threading.Event()
 
 
 def rows(sql: str, args=()):
@@ -388,7 +398,9 @@ def publishing_account_groups() -> list[dict]:
         group["account_count"] = len(group_members)
         group["publishable_count"] = sum(1 for item in group_members if item.get("publishable"))
         group["needs_login_count"] = sum(1 for item in group_members if item.get("integration_type") == "browser" and item.get("login_status") != "logged_in")
-        group["untested_count"] = sum(1 for item in group_members if item.get("capability_status") != "passed")
+        group["needs_auth_count"] = sum(1 for item in group_members if item.get("integration_type") == "api" and item.get("authorization_status") != "authorized")
+        # 保留旧字段供旧客户端读取，但开发验收状态不再作为用户门禁。
+        group["untested_count"] = 0
         group["platforms"] = list(dict.fromkeys(item.get("platform_name") or item.get("platform_code") for item in group_members))
     return groups
 
@@ -449,18 +461,9 @@ def delete_account_group(group_id: int) -> None:
 
 
 def _group_member_gate(account: dict) -> tuple[bool, str, str]:
-    capability = str(account.get("capability_status") or "untested")
-    if capability == "untested":
-        return False, "PLATFORM_UNTESTED", "平台尚未完成真实验收"
-    if capability == "failed":
-        return False, "PLATFORM_FAILED", "平台验收失败"
-    if capability == "limited":
-        return False, "PLATFORM_LIMITED", "平台当前仅支持部分功能"
-    if capability != "passed":
-        return False, "PLATFORM_UNTESTED", "平台尚未完成真实验收"
     if str(account.get("integration_type") or "browser") == "api":
         if str(account.get("authorization_status") or "") != "authorized":
-            return False, "OAUTH_EXPIRED", "OAuth授权已失效"
+            return False, "OAUTH_EXPIRED", "请先完成平台授权"
     elif str(account.get("login_status") or "") != "logged_in":
         return False, "AUTH_EXPIRED", "账号尚未登录"
     return True, "", ""
@@ -559,6 +562,7 @@ def _create_group_publish_batch(data: dict) -> dict:
                 continue
             payload = dict(data)
             payload["account_ids"] = [int(account["account_id"])]
+            payload["platform"] = str(account["platform_code"] or "")
             payload["group_id"] = group_id
             payload["group_batch_id"] = batch_id
             task_id = create_publish_task(payload)
@@ -763,12 +767,24 @@ def open_account_profile(account_id: int) -> dict:
     return {"path": open_profile_folder(account["browser_profile_path"])}
 
 
+_UPDATE_STATE_LOCK = threading.Lock()
+_UPDATE_STATE = {"state": "idle", "message": "", "error": "", "version": ""}
+
+
+def _set_update_state(state: str, message: str, *, error: str = "", version: str = "") -> None:
+    with _UPDATE_STATE_LOCK:
+        _UPDATE_STATE.update(state=state, message=message, error=error, version=version or _UPDATE_STATE.get("version", ""))
+
+
 def update_status() -> dict:
     config = settings()
+    with _UPDATE_STATE_LOCK:
+        update_process = dict(_UPDATE_STATE)
     return {
         "current_version": current_version(),
         "auto_check_update": str(config.get("auto_check_update", "1")).lower() in ("1", "true", "on", "yes"),
         "configured": bool(configured_manifest_url(config)),
+        "update_process": update_process,
     }
 
 
@@ -780,13 +796,37 @@ def check_configured_update() -> dict:
 
 
 def apply_configured_update() -> dict:
+    with _UPDATE_STATE_LOCK:
+        if _UPDATE_STATE["state"] in {"preparing", "downloading", "backing_up", "launching"}:
+            return dict(_UPDATE_STATE)
     result = check_configured_update()
     if not result.get("available"):
         raise UpdateError("当前已经是最新版本")
-    manifest = UpdateManifest(**result["manifest"])
-    staged = stage_and_launch(manifest)
-    threading.Timer(1.0, lambda: os._exit(0)).start()
-    return staged
+    manifest = UpdateManifest.from_dict(result["manifest"])
+    UPDATE_SHUTDOWN_EVENT.clear()
+    _set_update_state("preparing", "准备更新...", version=manifest.version)
+
+    def run_update() -> None:
+        stages = {
+            "准备下载更新组件...": ("preparing", "准备更新组件..."),
+            "正在下载新版程序...": ("downloading", "正在下载新版程序..."),
+            "正在备份用户数据...": ("backing_up", "正在备份用户数据..."),
+            "正在通知软件退出...": ("launching", "准备关闭程序..."),
+        }
+
+        def report_stage(message: str) -> None:
+            state, text = stages.get(message, ("preparing", message))
+            _set_update_state(state, text, version=manifest.version)
+
+        try:
+            stage_and_launch(manifest, status_callback=report_stage)
+            _set_update_state("launching", "更新器已启动，正在关闭程序...", version=manifest.version)
+            threading.Timer(0.5, UPDATE_SHUTDOWN_EVENT.set).start()
+        except Exception as exc:
+            _set_update_state("failed", "更新失败", error=str(exc), version=manifest.version)
+
+    threading.Thread(target=run_update, name="mixcut-update-worker", daemon=True).start()
+    return dict(_UPDATE_STATE)
 
 
 def media_url(path: str) -> str:
@@ -820,12 +860,13 @@ def generate_title_preview(data):
     if font_dir and Path(font_dir).is_dir():
         title_filter += f":fontsdir='{ffmpeg_filter_path(font_dir)}'"
     ffmpeg = find_ffmpeg()
+    command = [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=0xE4EAF4:s=1080x1920:d=1",
+               "-vf", title_filter, "-frames:v", "1", "-q:v", "2", str(output_path)]
     proc = subprocess.run(
-        [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=0xE4EAF4:s=1080x1920:d=1",
-         "-vf", title_filter, "-frames:v", "1", "-q:v", "2", str(output_path)],
+        command,
         capture_output=True,
         timeout=30,
-        **background_process_kwargs(),
+        **background_process_kwargs(command, "title_preview_render"),
     )
     if proc.returncode != 0 or not output_path.exists():
         raise ValueError("标题预览渲染失败")
@@ -959,7 +1000,8 @@ def bootstrap():
             "publish_group_batch_items": publish_group_batch_items,
             "platform_test_runs": platform_test_runs, "admin_mode": is_admin_mode(),
             "media_runtime": get_media_runtime_status(),
-            "settings": public_settings(), "db_path": str(DB_PATH)}
+            "video_acceleration": video_acceleration_status(),
+            "settings": public_settings(), "app_version": current_version(), "db_path": str(DB_PATH)}
 
 
 def dashboard_task_snapshot():
@@ -1623,7 +1665,8 @@ def open_task_output(task_id: int):
     output = Path(str((task or {}).get("output_path") or ""))
     if not output.is_file():
         raise FileNotFoundError("成片文件不存在")
-    subprocess.Popen(["explorer.exe", "/select,", str(output)])
+    command = ["explorer.exe", "/select,", str(output)]
+    subprocess.Popen(command, **background_process_kwargs(command, "open_task_output"))
     return True
 
 
@@ -1686,7 +1729,8 @@ def open_task_log(task_id: int) -> dict:
     if os.name == "nt":
         os.startfile(str(path))
     else:
-        subprocess.Popen(["xdg-open", str(path)])
+        command = ["xdg-open", str(path)]
+        subprocess.Popen(command, **background_process_kwargs(command, "open_task_log"))
     return {"opened": True, "file_name": path.name}
 
 
@@ -1698,9 +1742,10 @@ $dialog.ShowNewFolderButton = $true
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.SelectedPath) }
 '''
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    p = subprocess.run(["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded],
+    command = ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded]
+    p = subprocess.run(command,
                        capture_output=True, text=True, timeout=300, encoding="utf-8", errors="ignore",
-                       **background_process_kwargs())
+                       **background_process_kwargs(command, "select_folder_dialog"))
     return (p.stdout or "").strip()
 
 
@@ -1713,10 +1758,11 @@ $dialog.Filter = "Image files|*.jpg;*.jpeg;*.jfif;*.png;*.webp;*.bmp;*.tif;*.tif
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.FileName) }
 '''
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    command = ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded]
     process = subprocess.run(
-        ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded],
+        command,
         capture_output=True, text=True, timeout=300, encoding="utf-8", errors="ignore",
-        **background_process_kwargs(),
+        **background_process_kwargs(command, "select_cover_dialog"),
     )
     selected = (process.stdout or "").lstrip("\ufeff").strip()
     return normalize_cover_path(selected) if selected else ""
@@ -1732,10 +1778,11 @@ $dialog.Filter = "Google OAuth JSON|*.json|All files|*.*"
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.FileName) }
 '''
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    command = ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded]
     process = subprocess.run(
-        ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded],
+        command,
         capture_output=True, text=True, timeout=300, encoding="utf-8", errors="ignore",
-        **background_process_kwargs(),
+        **background_process_kwargs(command, "select_oauth_json_dialog"),
     )
     selected = (process.stdout or "").lstrip("\ufeff").strip()
     if not selected:
@@ -1757,10 +1804,11 @@ $dialog.Filter = "Voice sample|*.mp3;*.m4a;*.wav|All files|*.*"
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Write($dialog.FileName) }
 '''
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    command = ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded]
     process = subprocess.run(
-        ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded],
+        command,
         capture_output=True, text=True, timeout=300, encoding="utf-8", errors="ignore",
-        **background_process_kwargs(),
+        **background_process_kwargs(command, "select_voice_dialog"),
     )
     return (process.stdout or "").lstrip("\ufeff").strip()
 
@@ -1785,21 +1833,74 @@ def clone_tts_voice(service_id: int, data: dict):
     return result
 
 
+def _inspect_material_directory(folder: str | Path) -> dict:
+    """Validate only the directory itself, never its video count.
+
+    ``os.access`` is deliberately not used here: on Windows it can report a
+    directory as readable even when the first directory operation is denied.
+    Opening the iterator and consuming one entry is a reliable, non-mutating
+    read probe and also succeeds for an empty directory.
+    """
+    configured = str(folder or "").strip()
+    if not configured:
+        return {
+            "exists": False, "readable": False, "has_videos": False,
+            "video_count": 0, "error_code": "MATERIAL_ROOT_NOT_CONFIGURED",
+            "message": "素材目录不存在，请重新选择",
+        }
+    root = Path(configured)
+    try:
+        if not root.exists() or not root.is_dir():
+            return {
+                "exists": False, "readable": False, "has_videos": False,
+                "video_count": 0, "error_code": "MATERIAL_ROOT_NOT_FOUND",
+                "message": "素材目录不存在，请重新选择",
+            }
+        iterator = root.iterdir()
+        next(iterator, None)  # Empty directories are valid and remain readable.
+        return {
+            "exists": True, "readable": True, "has_videos": False,
+            "video_count": 0, "error_code": "", "message": "目录可用",
+        }
+    except PermissionError:
+        return {
+            "exists": True, "readable": False, "has_videos": False,
+            "video_count": 0, "error_code": "MATERIAL_ROOT_PERMISSION_DENIED",
+            "message": "当前目录没有读取权限，请更换目录",
+        }
+    except OSError as exc:
+        return {
+            "exists": False, "readable": False, "has_videos": False,
+            "video_count": 0, "error_code": "MATERIAL_ROOT_UNAVAILABLE",
+            "message": f"素材目录无法访问，请重新选择（{exc}）",
+        }
+
+
 def material_root_status() -> dict:
     configured = str(settings().get("material_root") or "").strip()
+    inspection = _inspect_material_directory(configured)
     root = Path(configured) if configured else None
-    return {"folder": configured, "exists": bool(root and root.is_dir()), "scanning": MATERIAL_SCAN_LOCK.locked()}
+    # Video presence is informational only. It must never make a readable
+    # directory invalid, especially before the first scan.
+    if inspection["readable"] and root:
+        try:
+            count = sum(1 for path in root.rglob("*") if path.is_file() and path.suffix.lower() in VIDEO_EXTS)
+            inspection.update(has_videos=count > 0, video_count=count)
+            inspection["message"] = "目录可用" if count else "该目录暂无可用视频素材"
+        except (PermissionError, OSError):
+            pass
+    return {"folder": configured, **inspection, "scanning": MATERIAL_SCAN_LOCK.locked()}
 
 
 def open_material_root() -> dict:
     state = material_root_status()
     root = Path(state["folder"])
     if not state["exists"]:
-        raise ValueError("当前素材目录不可用，请重新选择素材目录")
-    if os.name == "nt":
-        os.startfile(str(root))
-    else:
-        subprocess.Popen(["xdg-open", str(root)])
+        raise ValueError(state["message"])
+    if not state["readable"]:
+        raise PermissionError(state["message"])
+    command = ["explorer.exe", str(root)] if os.name == "nt" else ["xdg-open", str(root)]
+    subprocess.Popen(command, **background_process_kwargs(command, "open_data_folder"))
     return {"opened": True, "folder": str(root)}
 
 
@@ -1823,9 +1924,12 @@ def _material_error_text(exc: Exception) -> str:
 def scan_materials(folder: str = ""):
     """Incrementally synchronize the configured material root with SQLite."""
     configured = str(folder or settings().get("material_root") or "").strip()
+    inspection = _inspect_material_directory(configured)
     root = Path(configured) if configured else None
-    if not root or not root.is_dir():
-        raise ValueError("当前素材目录不可用，请选择新的素材文件夹")
+    if not inspection["exists"]:
+        raise ValueError(inspection["message"])
+    if not inspection["readable"]:
+        raise PermissionError(inspection["message"])
     if not MATERIAL_SCAN_LOCK.acquire(blocking=False):
         raise ValueError("素材正在扫描中")
 
@@ -2210,47 +2314,45 @@ def match_shot(
     task_id: int | None = None,
     avoid_material_ids=None,
     previous_match=None,
+    material_strategy="random",
 ):
     shot = row("SELECT * FROM template_shots WHERE id=?", (shot_id,))
     if not shot:
         raise ValueError("镜头不存在")
     duration = float(shot.get("voice_duration") or 0)
     if duration <= 0:
-        raise ValueError("请先生成或导入镜头语音")
-    candidates = rows("""SELECT * FROM materials WHERE status='active' AND category_id=? AND duration>=?
-        ORDER BY (width*height) DESC,duration DESC""", (shot.get("material_category_id"), duration))
+        raise ValueError("请先生成镜头语音，再匹配素材")
+    with connect() as conn:
+        pool_stats = material_pool_diagnostics(
+            conn, int(shot.get("material_category_id") or 0), duration
+        )
+        candidates = load_material_candidates(conn, int(shot.get("material_category_id") or 0), duration)
     excluded = set(exclude_ids or [])
     avoided = set(avoid_material_ids or [])
     previous_material_id = int((previous_match or {}).get("material_id") or 0)
-
-    # New tasks first avoid every material used by the previous task.  If the
-    # category pool is small, at least avoid the material used by this same shot.
-    # Only fall back to reuse when the library genuinely has no alternative.
-    pools = [
-        [m for m in candidates if m["id"] not in excluded and m["id"] not in avoided],
-        [m for m in candidates if m["id"] not in excluded and m["id"] != previous_material_id],
-        [m for m in candidates if m["id"] not in excluded],
-        [m for m in candidates if m["id"] != previous_material_id],
-        candidates,
-    ]
-    available = next((pool for pool in pools if pool), [])
-    if not available:
+    try:
+        material, diagnostics = select_material(
+            candidates,
+            strategy=material_strategy,
+            exclude_ids=excluded,
+            avoid_ids=avoided | ({previous_material_id} if previous_material_id else set()),
+        )
+        diagnostics.update(pool_stats)
+    except ValueError:
         category = row("SELECT name FROM material_categories WHERE id=?", (shot.get("material_category_id"),))
         short = row("SELECT MAX(duration) duration FROM materials WHERE status='active' AND category_id=?", (shot.get("material_category_id"),))
         max_duration = float((short or {}).get("duration") or 0)
-        raise ValueError(f"素材不足：需要 {duration:.1f} 秒{(category or {}).get('name','')}素材，当前最长只有 {max_duration:.1f} 秒")
-    top_pixels = int(available[0].get("width", 0)) * int(available[0].get("height", 0))
-    top = [m for m in available if int(m.get("width", 0)) * int(m.get("height", 0)) == top_pixels]
-    material = random.choice(top)
+        raise ValueError(
+            f"素材不足：需要 {duration:.1f} 秒{(category or {}).get('name','')}素材，"
+            f"当前最长只有 {max_duration:.1f} 秒"
+        )
     max_start = max(0.0, float(material["duration"]) - duration)
     if task_id is not None and material["id"] == previous_material_id and max_start <= 0.5:
         raise ValueError(
-            f"素材不足：镜头只能复用上一任务的 {material['file_name']}，"
-            "且没有足够长度切换到不同画面，请补充该分类素材"
+            f"当前分类只有素材 {material['file_name']} 可用，且无法选择不同片段。"
+            "请补充该分类素材后重试。"
         )
     start = random.uniform(0.0, max_start) if max_start > 0.05 else 0.0
-    # With only one usable source video, still choose a different section when
-    # the source has enough spare duration.
     if material["id"] == previous_material_id and max_start > 0.5:
         old_start = float((previous_match or {}).get("material_start_time") or 0)
         min_gap = min(max_start / 2, max(0.5, duration * 0.25))
@@ -2268,10 +2370,17 @@ def match_shot(
             conn.execute("DELETE FROM generation_shot_materials WHERE shot_id=? AND task_id=?", (shot_id, task_id))
         conn.execute("""INSERT INTO generation_shot_materials(task_id,shot_id,material_id,voice_duration,material_start_time,material_end_time,created_at,updated_at)
             VALUES(?,?,?,?,?,?,?,?)""", (task_id, shot_id, material["id"], duration, start, end, now(), now()))
-    return {"material_id": material["id"], "file_name": material["file_name"], "duration": material["duration"], "start": start, "end": end}
-
+    return {
+        "material_id": material["id"], "file_name": material["file_name"],
+        "duration": material["duration"], "start": start, "end": end,
+        "usage_count": int(material.get("usage_count") or 0),
+        "last_used_at": str(material.get("last_used_at") or ""),
+        "selection_reason": diagnostics["selection_reason"],
+        "diagnostics": diagnostics,
+    }
 
 def generate_tts(shot_id: int):
+    from generation_performance import measure
     shot = row("SELECT * FROM template_shots WHERE id=?", (shot_id,))
     if not shot:
         raise ValueError("镜头不存在")
@@ -2282,20 +2391,29 @@ def generate_tts(shot_id: int):
     voice, config = resolve_tts_voice(cfg, text)
     speed = float(cfg.get("tts_speed") or 1.0)
     segment_gap_ms = int(float(cfg.get("tts_segment_gap_ms") or 60))
+    result = generate_shot_audio(shot_id, text, config, voice, cfg, speed)
+    return commit_shot_audio(shot, text, config, voice, cfg, speed, segment_gap_ms, result)
+
+
+def generate_shot_audio(shot_id, text, config, voice, cfg, speed=1.0):
+    """Generate audio artifacts only; caller owns subtitle and database updates."""
+    from generation_performance import measure
     # Spaces are explicit cuts in Chinese scripts, but normal word separators
     # in English, Spanish and Vietnamese. Never synthesize Latin text word by word.
     text_parts = split_text(text) if contains_cjk(text) else [text]
     exact_subtitle_segments = []
     part_paths = []
     if len(text_parts) > 1:
-        for index, part in enumerate(text_parts, 1):
-            part_path, part_duration = synthesize_tts(
-                config, voice, part, f"{shot_id}_part_{index:03d}", cfg, speed
+        with measure("tts"):
+            for index, part in enumerate(text_parts, 1):
+                part_path, part_duration = synthesize_tts(
+                    config, voice, part, f"{shot_id}_part_{index:03d}", cfg, speed
+                )
+                part_paths.append(part_path)
+        with measure("audio_mix"):
+            voice_path, duration, timings = concatenate_tts_wavs(
+                part_paths, str(VOICE_DIR / f"shot_{shot_id}.wav"), cfg, return_timings=True
             )
-            part_paths.append(part_path)
-        voice_path, duration, timings = concatenate_tts_wavs(
-            part_paths, str(VOICE_DIR / f"shot_{shot_id}.wav"), cfg, return_timings=True
-        )
         exact_subtitle_segments = [
             {"start": timing["start"], "end": timing["end"], "text": part}
             for part, timing in zip(text_parts, timings)
@@ -2303,14 +2421,56 @@ def generate_tts(shot_id: int):
         for generated in VOICE_DIR.glob(f"shot_{shot_id}_part_*.*"):
             generated.unlink(missing_ok=True)
     else:
-        voice_path, duration = synthesize_tts(config, voice, text, shot_id, cfg, speed)
+        with measure("tts"):
+            voice_path, duration = synthesize_tts(config, voice, text, shot_id, cfg, speed)
+    return {"shot_id": shot_id, "audio_path": voice_path, "duration": duration,
+            "subtitle_segments": exact_subtitle_segments}
+
+
+def prepare_all_shot_audio(shots, cfg, speed=1.0):
+    """Prepare audio with bounded concurrency; callers still commit in order."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def prepare_one(shot):
+        shot_id = shot["id"]
+        text = normalize_rewrite_text(shot_script_text(shot))
+        voice, config = resolve_tts_voice(cfg, text)
+        result = generate_shot_audio(shot_id, text, config, voice, cfg, speed)
+        return shot, text, config, voice, result
+
+    # executor.map preserves input order even when later shots finish first.
+    prepared = []
+    seen_paths = set()
+    with ThreadPoolExecutor(max_workers=3, thread_name_prefix="tts-prepare") as executor:
+      for shot, text, config, voice, result in executor.map(prepare_one, shots):
+        shot_id = shot["id"]
+        path = str(result.get("audio_path") or "")
+        duration = float(result.get("duration") or 0)
+        if result.get("shot_id") != shot_id or not path or duration <= 0 or path in seen_paths:
+            raise ValueError(f"TTS音频结果校验失败：镜头 {shot_id}")
+        seen_paths.add(path)
+        prepared.append({"shot_id": shot_id, "audio_path": path, "duration": duration,
+                         "subtitle_segments": result.get("subtitle_segments") or [],
+                         "text": text, "config": config, "voice": voice})
+    return prepared
+
+
+def commit_shot_audio(shot, text, config, voice, cfg, speed, segment_gap_ms, result):
+    """Commit serially on the generation caller, never on an audio worker."""
+    from generation_performance import measure
+    shot_id = shot["id"]
+    if result["shot_id"] != shot_id:
+        raise ValueError("TTS result does not belong to this shot")
+    voice_path, duration = result["audio_path"], result["duration"]
+    exact_subtitle_segments = result["subtitle_segments"]
     subtitle_path = ""
     if shot.get("enable_subtitle") and str(cfg.get("subtitle_enabled") or "1") != "0":
-        subtitle_path = (
-            generate_ass_from_segments(shot_id, exact_subtitle_segments)
-            if exact_subtitle_segments
-            else generate_ass_for_shot(shot_id, voice_path, text, duration)[0]
-        )
+        with measure("subtitle"):
+            subtitle_path = (
+                generate_ass_from_segments(shot_id, exact_subtitle_segments)
+                if exact_subtitle_segments
+                else generate_ass_for_shot(shot_id, voice_path, text, duration)[0]
+            )
     with connect() as conn:
         conn.execute("UPDATE template_shots SET voice_file_path=?,voice_duration=?,estimated_duration=?,subtitle_file_path=?,subtitle_render_hash=?,voice_text_hash=?,updated_at=? WHERE id=?",
                      (voice_path, duration, duration, subtitle_path, subtitle_signature(text) if subtitle_path else "", voice_render_hash(text, config, voice, speed, segment_gap_ms), now(), shot_id))
@@ -2324,7 +2484,8 @@ def save_ai_service(data):
     existing = row("SELECT api_key FROM ai_service_configs WHERE id=?", (int(data.get("id") or 0),)) if data.get("id") else None
     submitted_key = str(data.get("api_key") or "").strip()
     stored_key = encrypt_secret(submitted_key) if submitted_key else str((existing or {}).get("api_key") or "")
-    values = (name, str(data.get("provider") or "openai_compatible"), str(data.get("base_url") or ""), stored_key, str(data.get("model") or ""), int(data.get("timeout_seconds") or 60), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0, str(data.get("system_prompt") or ""))
+    system_prompt = str(data.get("system_prompt") or "").strip() or DEFAULT_REWRITE_PROMPT
+    values = (name, str(data.get("provider") or "openai_compatible"), str(data.get("base_url") or ""), stored_key, str(data.get("model") or ""), int(data.get("timeout_seconds") or 60), 1 if data.get("is_enabled", True) else 0, 1 if data.get("is_default") else 0, system_prompt)
     with connect() as conn:
         if values[7]: conn.execute("UPDATE ai_service_configs SET is_default=0")
         if data.get("id"):
@@ -2332,6 +2493,33 @@ def save_ai_service(data):
             return int(data["id"])
         conn.execute("INSERT INTO ai_service_configs(name,provider,base_url,api_key,model,timeout_seconds,is_enabled,is_default,system_prompt,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (*values, now(), now()))
         return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def open_bailian_api_key_page() -> dict:
+    """Open the official Bailian key page in the user's system browser."""
+    if not webbrowser.open(BAILIAN_API_KEY_URL, new=1):
+        raise RuntimeError("无法打开系统默认浏览器")
+    return {"ok": True, "url": BAILIAN_API_KEY_URL}
+
+
+_SECRET_PLACEHOLDERS = {
+    "已配置，重新输入可覆盖", "已配置", "••••••••••••••••",
+    "****************", "********",
+}
+
+
+def resolve_ai_test_config(data: dict) -> dict:
+    """Merge current form values with only the stored secret, without saving."""
+    form = dict(data.get("config") or data or {})
+    record_id = int(form.get("id") or 0)
+    submitted_key = str(form.get("api_key") or "").strip()
+    if submitted_key in _SECRET_PLACEHOLDERS or set(submitted_key) <= {"*", "•"}:
+        submitted_key = ""
+    stored = runtime_config("ai_service_configs", record_id) if record_id else {}
+    config = dict(stored or {})
+    config.update({key: value for key, value in form.items() if key != "api_key"})
+    config["api_key"] = submitted_key or str((stored or {}).get("api_key") or "")
+    return config
 
 
 def save_tts_service(data):
@@ -2391,6 +2579,7 @@ def rewrite_shot(
     profile_id: int | None = None,
     variation_context: str = "",
     temperature: float = 0.45,
+    retry_callback=None,
 ):
     shot = row("SELECT * FROM template_shots WHERE id=?", (shot_id,))
     if not shot: raise ValueError("镜头不存在")
@@ -2400,7 +2589,7 @@ def rewrite_shot(
     profile = row("SELECT * FROM account_profiles WHERE id=?", (profile_id,)) if profile_id else row("SELECT * FROM account_profiles ORDER BY updated_at DESC,id DESC LIMIT 1")
     profile = profile or {}
     source_language = detect_text_language(shot.get("original_text") or "")
-    system = config.get("system_prompt") or "你是短视频口播文案编辑 保持原句含义和事实准确 只输出改写文案"
+    system = config.get("system_prompt") or DEFAULT_REWRITE_PROMPT
     system += f" 原文语言为 {source_language} 改写结果必须保持相同语言 禁止翻译成其他语言"
     if source_language != "zh-CN":
         system += " 拉丁文字中的普通单词空格必须保留 不要把每个单词当成独立配音段"
@@ -2413,6 +2602,8 @@ def rewrite_shot(
         config,
         [{"role":"system","content":system},{"role":"user","content":user}],
         temperature=temperature,
+        attempts=3,
+        retry_callback=retry_callback,
     )
     content = normalize_rewrite_text(content.strip().strip('"“”'))
     with connect() as conn:
@@ -2450,6 +2641,7 @@ def rewrite_template_shots(
     profile_id: int | None = None,
     variation_context: str = "",
     temperature: float = 0.45,
+    retry_callback=None,
 ):
     shots = rows("SELECT * FROM template_shots WHERE template_id=? ORDER BY sort_order,id", (template_id,))
     if not shots:
@@ -2472,7 +2664,7 @@ def rewrite_template_shots(
         for s in shots
     ]
     system = (
-        "你是短视频口播文案编辑。根据账号资料一次性改写全部镜头，保持镜头顺序和事实准确。"
+        DEFAULT_REWRITE_PROMPT + "\n\n根据账号资料一次性改写全部镜头，保持镜头顺序和事实准确。"
         "输出禁止使用任何中英文标点符号 特殊符号或Emoji 只允许文字数字和空格。"
         "使用单个空格作为字幕与配音的唯一硬分段标记。"
         "只返回严格 JSON 数组，不要 Markdown；每项格式为 {\"id\":镜头ID,\"ai_text\":\"改写文案\"}。"
@@ -2496,6 +2688,8 @@ def rewrite_template_shots(
         config,
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=temperature,
+        attempts=3,
+        retry_callback=retry_callback,
     )
     try:
         rewritten = parse_rewrite_batch(content, [s["id"] for s in shots])
@@ -2506,7 +2700,7 @@ def rewrite_template_shots(
             results = list(
                 pool.map(
                     lambda shot: rewrite_shot(
-                        shot["id"], profile_id, variation_context, temperature
+                        shot["id"], profile_id, variation_context, temperature, retry_callback
                     ),
                     shots,
                 )
@@ -2648,6 +2842,8 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
     if not output_dir or not Path(output_dir).parent.exists():
         output_dir = str(APP_DIR / "outputs")
     def worker():
+        from generation_performance import start as start_performance, finish as finish_performance, measure
+        start_performance(task_id)
         try:
           with task_context(task_id):
             if before_generation is not None:
@@ -2688,13 +2884,36 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
                     for item in rows(
                         """SELECT DISTINCT gsm.material_id FROM batch_task_items i
                            JOIN generation_shot_materials gsm ON gsm.task_id=i.task_id
-                           WHERE i.batch_id=? AND i.index_no<?""",
+                           JOIN generation_tasks g ON g.id=i.task_id
+                           WHERE i.batch_id=? AND i.index_no<?
+                             AND g.status IN ('completed','succeeded')""",
                         (batch_context["batch_id"], batch_context["index_no"]),
                     )
                 )
             elif batch_context and batch_context["material_strategy"] == "random":
                 previous_matches = {}
                 previous_materials = set()
+            prepared_audio = {}
+            stale_audio_shots = []
+            for candidate in task_shots:
+                candidate_text = shot_script_text(candidate)
+                candidate_voice, candidate_config = resolve_tts_voice(cfg, candidate_text)
+                candidate_path = str(candidate.get("voice_file_path") or "")
+                candidate_stale = (
+                    float(candidate.get("voice_duration") or 0) <= 0
+                    or not candidate_path
+                    or not Path(candidate_path).is_file()
+                    or str(candidate.get("voice_text_hash") or "") != voice_render_hash(
+                        candidate_text, candidate_config, candidate_voice, selected_speed, selected_segment_gap_ms
+                    )
+                )
+                if candidate.get("enable_tts") and candidate_stale:
+                    stale_audio_shots.append(candidate)
+            if stale_audio_shots:
+                heartbeat(task_id, stage="tts", step=f"准备配音 0/{len(stale_audio_shots)}", progress=4)
+                for prepared in prepare_all_shot_audio(stale_audio_shots, cfg, selected_speed):
+                    prepared_audio[prepared["shot_id"]] = prepared
+
             for index, shot in enumerate(task_shots, 1):
                 check_cancelled(task_id)
                 base_progress = 3 + int((index - 1) / max(1, len(task_shots)) * 37)
@@ -2715,7 +2934,24 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
                 if shot.get("enable_tts") and voice_stale:
                     heartbeat(task_id, stage="tts", step=f"生成配音 {index}/{len(task_shots)}",
                               progress=base_progress + 1)
-                    generate_tts(shot["id"])
+                    prepared = prepared_audio.pop(shot["id"], None)
+                    if prepared is None:
+                        raise ValueError(f"镜头 {shot['id']} 的配音准备结果不存在")
+                    commit_shot_audio(
+                        shot,
+                        prepared["text"],
+                        prepared["config"],
+                        prepared["voice"],
+                        cfg,
+                        selected_speed,
+                        selected_segment_gap_ms,
+                        {
+                            "shot_id": prepared["shot_id"],
+                            "audio_path": prepared["audio_path"],
+                            "duration": prepared["duration"],
+                            "subtitle_segments": prepared["subtitle_segments"],
+                        },
+                    )
                     # A regenerated voice can have a different real duration, so
                     # its previous material crop is no longer valid.
                     with connect() as conn:
@@ -2755,9 +2991,10 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
                     if subtitle_stale:
                         heartbeat(task_id, stage="subtitle", step=f"生成字幕 {index}/{len(task_shots)}",
                                   progress=base_progress + 3)
-                        subtitle_path, _ = generate_ass_for_shot(
-                            shot["id"], shot["voice_file_path"], text, float(shot.get("voice_duration") or 0)
-                        )
+                        with measure("subtitle"):
+                            subtitle_path, _ = generate_ass_for_shot(
+                                shot["id"], shot["voice_file_path"], text, float(shot.get("voice_duration") or 0)
+                            )
                         with connect() as conn:
                             conn.execute(
                                 "UPDATE template_shots SET subtitle_file_path=?,subtitle_render_hash=?,updated_at=? WHERE id=?",
@@ -2767,12 +3004,27 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
                 # so creating a new task never silently reuses the old preview.
                 heartbeat(task_id, stage="matching", step=f"匹配素材 {index}/{len(task_shots)}",
                           progress=base_progress + 4)
-                relation = match_shot(
-                    shot["id"],
-                    exclude_ids=used_materials,
-                    task_id=task_id,
-                    avoid_material_ids=previous_materials,
-                    previous_match=previous_matches.get(shot["id"]),
+                with measure("material_match"):
+                    relation = match_shot(
+                        shot["id"], exclude_ids=used_materials, task_id=task_id,
+                        avoid_material_ids=previous_materials,
+                        previous_match=previous_matches.get(shot["id"]),
+                        material_strategy=(batch_context or {}).get("material_strategy") or "random",
+                    )
+                diagnostic = relation.get("diagnostics") or {}
+                append_task_log(
+                    task_id,
+                    "素材匹配诊断 · "
+                    f"镜头={shot.get('shot_name') or shot['id']} · "
+                    f"素材库={diagnostic.get('registry_count', 0)} · "
+                    f"分类匹配={diagnostic.get('category_count', 0)} · "
+                    f"时长合格={diagnostic.get('duration_count', 0)} · "
+                    f"质量合格={diagnostic.get('valid_count', 0)} · "
+                    f"未使用={diagnostic.get('unused_candidates', 0)} · "
+                    f"本批可选={diagnostic.get('after_batch_exclusion', 0)} · "
+                    f"选择={relation.get('material_id')} {relation.get('file_name')} · "
+                    f"历史使用={relation.get('usage_count', 0)} · "
+                    f"策略={relation.get('selection_reason', '')}",
                 )
                 if (
                     batch_context
@@ -2792,11 +3044,15 @@ def start_generate(task_id: int, before_generation=None, *, queue_priority: int 
                     "current_shot='已取消',process_id=0,error_message='',finished_at=?,updated_at=? WHERE id=?",
                     (now(), now(), task_id),
                 )
+            finish_performance("cancelled")
         except BaseException as exc:
             wrapped = exc if isinstance(exc, Exception) else RuntimeError(
                 f"生成线程被异常中断：{type(exc).__name__}: {exc}"
             )
             fail_task(task_id, wrapped)
+            finish_performance(str(wrapped))
+        else:
+            finish_performance()
     with GENERATION_START_LOCK:
         if GENERATION_QUEUE.is_pending(task_id):
             current = row("SELECT status FROM generation_tasks WHERE id=?", (task_id,)) or {}
@@ -3000,6 +3256,102 @@ def template_script_snapshot(template_id: int) -> tuple[str, list[str]]:
     return "\x1f".join(texts), texts
 
 
+def fallback_template_to_original(template_id: int) -> tuple[str, list[str]]:
+    """Clear stale AI output and return the exact original-script snapshot."""
+    shots = rows(
+        "SELECT id,original_text FROM template_shots WHERE template_id=? ORDER BY sort_order,id",
+        (int(template_id),),
+    )
+    texts = [normalize_rewrite_text(item.get("original_text") or "") for item in shots]
+    if not shots or any(not text for text in texts):
+        raise AIRequestError(
+            "AI_PROVIDER_ERROR",
+            "AI\u6587\u6848\u751f\u6210\u5931\u8d25\uff0c\u4e14\u5b58\u5728\u6ca1\u6709\u539f\u59cb\u6587\u6848\u7684\u955c\u5934\u3002",
+        )
+    with connect() as conn:
+        for item in shots:
+            conn.execute(
+                """UPDATE template_shots SET ai_text='',voice_file_path='',voice_duration=0,
+                   estimated_duration=0,subtitle_file_path='',subtitle_render_hash='',voice_text_hash='',updated_at=?
+                   WHERE id=?""",
+                (now(), int(item["id"])),
+            )
+            conn.execute(
+                "DELETE FROM generation_shot_materials WHERE shot_id=? AND task_id IS NULL",
+                (int(item["id"]),),
+            )
+    return "\x1f".join(texts), texts
+
+
+def batch_ai_retry_logger(task_id: int):
+    """Translate backend retry events into truthful per-task progress logs."""
+    labels = {
+        "AI_TIMEOUT": "AI\u6587\u6848\u751f\u6210\u8d85\u65f6",
+        "AI_NETWORK_ERROR": "AI\u670d\u52a1\u7f51\u7edc\u8fde\u63a5\u5931\u8d25",
+        "AI_RATE_LIMITED": "AI\u8bf7\u6c42\u8fc7\u4e8e\u9891\u7e41",
+        "AI_PROVIDER_ERROR": "AI\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528",
+    }
+
+    def report(event: dict) -> None:
+        phase = str(event.get("phase") or "")
+        attempt = int(event.get("attempt") or 0)
+        total = int(event.get("total") or 3)
+        if phase == "attempt":
+            heartbeat(
+                task_id, stage="ai_rewrite",
+                step=f"AI\u6539\u5199 \u7b2c {attempt}/{total} \u6b21\u5c1d\u8bd5",
+                progress=min(3, attempt),
+                log=f"AI\u6539\u5199 \u00b7 \u7b2c {attempt}/{total} \u6b21\u5c1d\u8bd5",
+            )
+        elif phase == "retry":
+            delay = float(event.get("delay") or 0)
+            label = labels.get(str(event.get("code") or ""), "AI\u8bf7\u6c42\u5931\u8d25")
+            append_task_log(task_id, f"{label}\uff0c{delay:g}\u79d2\u540e\u91cd\u8bd5")
+        elif phase == "failed":
+            code = str(event.get("code") or "AI_PROVIDER_ERROR")
+            append_task_log(task_id, f"AI\u6539\u5199\u6700\u7ec8\u5931\u8d25 \u00b7 \u9519\u8bef\u7801={code}")
+
+    return report
+
+
+def rewrite_batch_or_fallback(task_id: int, template_id: int, *, variation: str,
+                              temperature: float) -> dict:
+    """Run AI rewrite with retry and degrade to original copy when possible."""
+    try:
+        from generation_performance import measure, event
+        import time
+        ai_started = time.perf_counter()
+        event("ai_start")
+        event("ai_request_start")
+        with measure("ai_copywriting"):
+            rewrite_template_shots(
+                int(template_id), variation_context=variation, temperature=temperature,
+                retry_callback=batch_ai_retry_logger(int(task_id)),
+            )
+        event("ai_request_end", time.perf_counter() - ai_started)
+        event("ai_response_parse", 0.0)
+        event("ai_result_save", 0.0)
+        signature, texts = template_script_snapshot(int(template_id))
+        return {"used_original": False, "signature": signature, "texts": texts, "error_code": ""}
+    except (AIRequestError, ServiceError, TimeoutError, ConnectionError, ValueError) as exc:
+        # Only the known missing-config ValueError is a degradable AI failure.
+        # Preserve unrelated validation/programming errors rather than hiding
+        # them behind an original-copy fallback.
+        if isinstance(exc, ValueError) and "配置并启用 AI 服务" not in str(exc):
+            raise
+        error_code = str(getattr(exc, "code", "") or "AI_PROVIDER_ERROR")
+        signature, texts = fallback_template_to_original(int(template_id))
+        if error_code == "AI_AUTH_FAILED":
+            message = "AI\u914d\u7f6e\u65e0\u6548\uff0c\u672c\u6761\u5df2\u4f7f\u7528\u539f\u6587\u7ee7\u7eed\u751f\u6210"
+        else:
+            message = "AI\u6539\u5199\u6682\u65f6\u4e0d\u53ef\u7528\uff0c\u672c\u6761\u5df2\u4f7f\u7528\u539f\u6587\u7ee7\u7eed\u751f\u6210"
+        heartbeat(
+            int(task_id), stage="ai_rewrite_fallback", step=message, progress=3,
+            log=f"{message} \u00b7 \u9519\u8bef\u7801={error_code}",
+        )
+        return {"used_original": True, "signature": signature, "texts": texts, "error_code": error_code}
+
+
 def start_batch_generation(task_id: int):
     """Generate a unique script inside the globally claimed generation slot."""
     context = row(
@@ -3037,7 +3389,7 @@ def start_batch_generation(task_id: int):
             check_cancelled(task_id)
             heartbeat(
                 task_id, stage="ai_rewrite",
-                step=f"\u751f\u6210\u72ec\u7acb\u6587\u6848 \u7b2c {attempt}/3 \u6b21\u5c1d\u8bd5",
+                step=f"\u6587\u6848\u5dee\u5f02\u68c0\u67e5 \u7b2c {attempt}/3 \u8f6e",
                 progress=min(3, attempt),
             )
             variation = (
@@ -3049,11 +3401,13 @@ def start_batch_generation(task_id: int):
                     "\n\u7981\u6b62\u590d\u7528\u4ee5\u4e0b\u5df2\u751f\u6210\u7248\u672c\u7684\u5b8c\u6574\u53e5\u5f0f\uff1a\n"
                     + "\n".join(previous_examples[-8:])[:5000]
                 )
-            rewrite_template_shots(
-                context["template_id"], variation_context=variation,
+            rewrite_result = rewrite_batch_or_fallback(
+                task_id, context["template_id"], variation=variation,
                 temperature=min(0.95, 0.72 + attempt * 0.08),
             )
-            current_signature, _ = template_script_snapshot(context["template_id"])
+            current_signature = rewrite_result["signature"]
+            if rewrite_result["used_original"]:
+                return
             if current_signature and current_signature not in previous_signatures:
                 break
         if not current_signature or current_signature in previous_signatures:
@@ -3092,9 +3446,17 @@ class CommercialHandler(SimpleHTTPRequestHandler):
             if smart_result is not None:
                 return self.json_response({"ok": True, "data": smart_result})
             if parsed.path == "/api/bootstrap":
+                FRONTEND_CONNECTED_EVENT.set()
+                startup_log(
+                    "frontend_connected",
+                    client=str(self.client_address[0] if self.client_address else ""),
+                    path=parsed.path,
+                )
                 return self.json_response({"ok": True, "data": bootstrap()})
             if parsed.path == "/api/runtime/media":
                 return self.json_response({"ok": True, "data": get_media_runtime_status()})
+            if parsed.path == "/api/video-acceleration":
+                return self.json_response({"ok": True, "data": video_acceleration_status()})
             if parsed.path == "/api/materials/root":
                 return self.json_response({"ok": True, "data": material_root_status()})
             if parsed.path == "/api/dashboard/tasks":
@@ -3309,6 +3671,8 @@ class CommercialHandler(SimpleHTTPRequestHandler):
             elif re.fullmatch(r"/api/publish/group-batches/\d+/retry-failed", parsed.path):
                 result = retry_group_batch_failed(int(parsed.path.split("/")[4]))
             elif parsed.path == "/api/publish/tasks":
+                if not str(data.get("platform") or "").strip():
+                    raise ValueError("缺少发布平台参数，请重新选择平台")
                 publish_task_id = create_publish_task(data)
                 with connect() as conn:
                     publish_task = conn.execute("SELECT status FROM publish_tasks WHERE id=?", (publish_task_id,)).fetchone()
@@ -3319,7 +3683,7 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = {"id": retry_platform_test(int(parsed.path.split("/")[3])), "status": "pending"}
             elif parsed.path == "/api/publish/ai-content":
                 result = generate_publish_content(
-                    int(data.get("video_id") or 0), str(data.get("platform") or "douyin"),
+                    int(data.get("video_id") or 0), str(data.get("platform") or ""),
                     int(data.get("profile_id") or 0) or None, str(data.get("current_title") or ""),
                     str(data.get("current_tags") or ""), str(data.get("current_cover_text") or ""),
                 )
@@ -3344,7 +3708,7 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 platform, account = publishing_account_context(account_id)
                 platform_code = str(platform.get("code") or "")
                 if platform_code == "tiktok":
-                    result = tiktok_login_status(account_id, account)
+                    result = probe_tiktok_login(account_id, account["browser_profile_path"]) if data.get("check") else tiktok_login_status(account_id, account)
                 elif platform_code in DOMESTIC_LOGIN_PLATFORMS:
                     result = domestic_login_status(account_id, {**account, "platform_code": platform_code})
                 else:
@@ -3369,8 +3733,11 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = open_account_profile(int(parsed.path.split("/")[4]))
             elif parsed.path == "/api/profiles/ai-suggestions": result = generate_profile_suggestions(data)
             elif parsed.path == "/api/ai-services": result = {"id": save_ai_service(data)}
+            elif parsed.path == "/api/ai-services/open-bailian-key": result = open_bailian_api_key_page()
+            elif parsed.path == "/api/ai-services/test-config":
+                result = test_ai_service(resolve_ai_test_config(data))
             elif re.fullmatch(r"/api/ai-services/\d+/test", parsed.path):
-                config = runtime_config("ai_service_configs", int(parsed.path.split("/")[3])); result = {"message": test_ai_service(config or {})}
+                config = runtime_config("ai_service_configs", int(parsed.path.split("/")[3])); result = test_ai_service(config or {})
             elif parsed.path == "/api/tts-services/test-config":
                 config = dict(data.get("config") or {})
                 if config.get("id") and not str(config.get("api_key") or "").strip():
@@ -3474,6 +3841,12 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                 result = generate_title_preview(data)
             else: return self.json_response({"ok": False, "error": "接口不存在"}, 404)
             return self.json_response({"ok": True, "data": result})
+        except AIRequestError as exc:
+            return self.json_response({
+                "ok": False,
+                "error": str(exc),
+                "code": exc.code,
+            }, 400)
         except PublishAIError as exc:
             return self.json_response({
                 "ok": False,
@@ -3538,6 +3911,12 @@ def prepare():
     recover_smart_split_jobs()
     migrate_provider_secrets()
     repair_missing_publish_records()
+    with connect() as conn:
+        # Seed only empty prompts; administrator customizations are preserved.
+        conn.execute(
+            "UPDATE ai_service_configs SET system_prompt=? WHERE COALESCE(TRIM(system_prompt),'')=''",
+            (DEFAULT_REWRITE_PROMPT,),
+        )
     cfg = settings()
     output = cfg.get("output_dir", "")
     if not output or not Path(output).parent.exists():

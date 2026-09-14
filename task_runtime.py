@@ -15,7 +15,7 @@ from datetime import datetime
 
 from db import connect, now
 from runtime_paths import TASK_LOG_DIR, ensure_runtime_dirs
-from subprocess_utils import background_process_kwargs
+from subprocess_utils import background_process_kwargs, infer_process_stage
 
 
 HEARTBEAT_INTERVAL_SECONDS = 5
@@ -112,6 +112,9 @@ def append_generation_worker_log(message: str) -> None:
 def classify_task_error(exc: Exception, stage: str = "") -> tuple[str, str]:
     raw = str(exc or "").strip()
     lowered = raw.lower()
+    ai_code = str(getattr(exc, "code", "") or "")
+    if ai_code.startswith("AI_"):
+        return ai_code, raw or "AI\u6587\u6848\u670d\u52a1\u6682\u65f6\u4e0d\u53ef\u7528\u3002"
     if "no audio was received" in lowered or "edge tts" in lowered:
         return "TTS_NO_AUDIO", "配音服务没有返回有效音频，请检查网络后重试，或在系统设置中切换其他配音服务。"
     if "ffmpeg" in lowered and ("未找到" in raw or "not found" in lowered):
@@ -577,8 +580,9 @@ def terminate_process(task_id: int) -> bool:
         return False
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True,
-                           timeout=10, **background_process_kwargs())
+            command = ["taskkill", "/PID", str(process.pid), "/T", "/F"]
+            subprocess.run(command, capture_output=True, timeout=10,
+                           **background_process_kwargs(command, "task_cancel"))
         else:
             process.terminate()
             try:
@@ -615,10 +619,18 @@ def run_managed_command(cmd: list[str], *, timeout: float, error_type=RuntimeErr
     task_id = current_task_id()
     check_cancelled(task_id)
     started = time.monotonic()
+    spawn_started = time.monotonic()
     process = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="ignore", shell=False, **background_process_kwargs()
+        encoding="utf-8", errors="ignore", shell=False,
+        **background_process_kwargs(cmd, infer_process_stage(cmd, "managed_external"))
     )
+    try:
+        from generation_performance import event
+        event("ffmpeg_process_spawn", time.monotonic() - spawn_started, executable=str(cmd[0]))
+        event("ffmpeg_render_start", 0.0, executable=str(cmd[0]))
+    except ImportError:
+        pass
     if task_id:
         with _lock:
             _processes[task_id] = process
@@ -635,7 +647,14 @@ def run_managed_command(cmd: list[str], *, timeout: float, error_type=RuntimeErr
         heartbeat(task_id, process_id=process.pid,
                   log=f"启动外部进程 · 程序={executable} · 输入数={input_count} · PID={process.pid}")
     try:
+        wait_started = time.monotonic()
         stdout, stderr = process.communicate(timeout=max(1.0, float(timeout)))
+        try:
+            from generation_performance import event
+            event("ffmpeg_wait_exit", time.monotonic() - wait_started, returncode=process.returncode)
+            event("ffmpeg_render_end", time.monotonic() - started, returncode=process.returncode)
+        except ImportError:
+            pass
     except subprocess.TimeoutExpired:
         if task_id:
             terminate_process(task_id)

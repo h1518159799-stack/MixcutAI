@@ -23,11 +23,6 @@ function hashtagText(value){
 }
 
 function accountGate(account){
-  const capability=String(account.capability_status||"untested");
-  if(capability==="untested")return {allowed:false,reason:"平台尚未完成验收"};
-  if(capability==="failed")return {allowed:false,reason:"平台验收失败"};
-  if(capability==="limited")return {allowed:false,reason:"平台当前仅部分可用"};
-  if(capability!=="passed")return {allowed:false,reason:"平台尚未完成验收"};
   if(account.integration_type==="api"&&account.authorization_status!=="authorized")return {allowed:false,reason:"需要重新授权"};
   if(account.integration_type!=="api"&&account.login_status!=="logged_in")return {allowed:false,reason:"需要重新登录"};
   return {allowed:true,reason:"可发布"};
@@ -42,7 +37,10 @@ export default function PublishDraftCard({
   onOpenAiSettings,onAccounts,request,Button,Icon,
 }){
   const metadata=video.publish_metadata||{};
-  const initialPlatform=platforms.find(platform=>accounts.some(account=>Number(account.platform_id)===Number(platform.id)))?.id||0;
+  const eligibleAccounts=useMemo(()=>accounts.filter(account=>accountGate(account).allowed),[accounts]);
+  const eligiblePlatformIds=useMemo(()=>new Set(eligibleAccounts.map(account=>Number(account.platform_id))),[eligibleAccounts]);
+  const eligiblePlatforms=useMemo(()=>platforms.filter(platform=>eligiblePlatformIds.has(Number(platform.id))),[platforms,eligiblePlatformIds]);
+  const initialPlatform=eligiblePlatforms[0]?.id||0;
   const [form,setForm]=useState({
     generation_task_id:video.id,
     title:metadata.title||video.task_name||"",
@@ -71,6 +69,13 @@ export default function PublishDraftCard({
   const dirtyFields=useRef(new Set());
 
   useEffect(()=>{
+    if(!eligiblePlatforms.some(platform=>Number(platform.id)===Number(selectedPlatformId))){
+      setSelectedPlatformId(eligiblePlatforms[0]?.id||0);
+      setForm(current=>({...current,account_ids:[]}));
+    }
+  },[eligiblePlatforms,selectedPlatformId]);
+
+  useEffect(()=>{
     setForm(current=>({
       ...current,
       title:dirtyFields.current.has("title")?current.title:(metadata.title||current.title),
@@ -82,12 +87,12 @@ export default function PublishDraftCard({
   },[metadata.updated_at,metadata.ai_status]);
 
   const platformAccounts=useMemo(
-    ()=>accounts.filter(account=>Number(account.platform_id)===Number(selectedPlatformId)),
-    [accounts,selectedPlatformId],
+    ()=>eligibleAccounts.filter(account=>Number(account.platform_id)===Number(selectedPlatformId)),
+    [eligibleAccounts,selectedPlatformId],
   );
   const selectedGroup=groups.find(group=>Number(group.id)===Number(selectedGroupId));
   const groupMembers=selectedGroup?.members||[];
-  const platformCode=platforms.find(item=>Number(item.id)===Number(selectedPlatformId))?.code||"douyin";
+  const platformCode=eligiblePlatforms.find(item=>Number(item.id)===Number(selectedPlatformId))?.code||"";
 
   const persistField=async(field,value,state="manually_edited")=>{
     try{
@@ -113,6 +118,7 @@ export default function PublishDraftCard({
 
   const regenerate=async mode=>{
     if(aiBusy)return;
+    if(!platformCode)return notify("请先选择发布平台");
     try{
       setAiBusy(mode);setAiError(null);
       const result=await request("/api/publish/ai-content",{method:"POST",body:{
@@ -156,13 +162,15 @@ export default function PublishDraftCard({
     if(scheduleMode==="timed"&&!form.scheduled_at)return notify("请选择定时发布时间");
     if(targetMode==="accounts"&&!form.account_ids.length)return notify("请选择发布账号");
     if(targetMode==="group"&&!selectedGroupId)return notify("请选择发布分组");
+    if(targetMode==="accounts"&&!platformCode)return notify("请选择发布平台");
     try{
       setBusy(true);
+      const payload={...form,platform:platformCode};
       if(targetMode==="group"){
-        const preview=await request("/api/publish/group-batches/preflight",{method:"POST",body:{...form,group_id:selectedGroupId}});
+        const preview=await request("/api/publish/group-batches/preflight",{method:"POST",body:{...payload,group_id:selectedGroupId}});
         setGroupPreview(preview);
       }else{
-        const result=await request("/api/publish/tasks",{method:"POST",body:form});
+        const result=await request("/api/publish/tasks",{method:"POST",body:payload});
         if(autoMode)await request(`/api/publish/tasks/${result.id}/enqueue`,{method:"POST",body:{}});
         notify(autoMode?"账号发布任务已加入队列":"账号待确认任务已创建");await refresh(false);
       }
@@ -198,13 +206,13 @@ export default function PublishDraftCard({
         <div className="publish-target-fields">
           <label><span>发布目标</span><select value={targetMode} onChange={event=>changeTargetMode(event.target.value)}><option value="accounts">单个账号</option><option value="group">账号分组</option></select></label>
           {targetMode==="accounts"&&<>
-            <label><span>平台</span><PlatformSelect platforms={platforms.filter(platform=>accounts.some(account=>Number(account.platform_id)===Number(platform.id)))} value={selectedPlatformId} compact onChange={choosePlatform}/></label>
+            <label><span>平台</span><PlatformSelect platforms={eligiblePlatforms} value={selectedPlatformId} compact onChange={choosePlatform}/></label>
             <label><span>账号</span><select className="publish-account-select" value={form.account_ids[0]||""} onChange={event=>chooseAccount(event.target.value)}><option value="">选择该平台账号</option>{platformAccounts.map(account=>{const gate=accountGate(account);return <option key={account.id} value={account.id} disabled={!gate.allowed}>{account.account_name}{account.channel_title?` · ${account.channel_title}`:""} · {gate.reason}</option>})}</select></label>
           </>}
           {targetMode==="group"&&groups.length>0&&<label><span>账号分组</span><select className="publish-group-select" value={selectedGroupId} onChange={event=>{setSelectedGroupId(Number(event.target.value));setGroupExpanded(false)}}><option value={0}>选择发布分组</option>{groups.map(group=><option key={group.id} value={group.id}>{group.name} · {group.account_count}个账号 · {group.publishable_count}个可发布</option>)}</select></label>}
         </div>
         {targetMode==="group"&&groups.length===0&&<div className="publish-group-empty"><b>还没有账号分组</b><span>请先将多个平台账号组合成发布矩阵。</span><Button quiet onClick={onAccounts}>新建账号分组</Button></div>}
-        {targetMode==="group"&&selectedGroup&&<div className="publish-group-summary"><button type="button" onClick={()=>setGroupExpanded(value=>!value)}><span>账号总数 {selectedGroup.account_count||groupMembers.length} · 可发布 {selectedGroup.publishable_count||0} · 需要登录 {selectedGroup.needs_login_count||0} · 待验收 {selectedGroup.untested_count||0}</span><b>{groupExpanded?"收起组内账号":"查看组内账号"}</b></button>{groupExpanded&&<div className="publish-group-members">{groupMembers.map(member=><span key={member.id||member.account_id}><b>{member.platform_name||"平台"} · {member.account_name||"账号"}</b><em>{member.publishable?"可发布":member.blocked_reason||"待处理"}</em></span>)}</div>}</div>}
+        {targetMode==="group"&&selectedGroup&&<div className="publish-group-summary"><button type="button" onClick={()=>setGroupExpanded(value=>!value)}><span>账号总数 {selectedGroup.account_count||groupMembers.length} · 可发布 {selectedGroup.publishable_count||0} · 需要登录 {selectedGroup.needs_login_count||0} · 需要授权 {selectedGroup.needs_auth_count||0}</span><b>{groupExpanded?"收起组内账号":"查看组内账号"}</b></button>{groupExpanded&&<div className="publish-group-members">{groupMembers.map(member=><span key={member.id||member.account_id}><b>{member.platform_name||"平台"} · {member.account_name||"账号"}</b><em>{member.publishable?"可发布":member.blocked_reason||"待处理"}</em></span>)}</div>}</div>}
         <div className="publish-target-buttons"><Button quiet onClick={()=>onPreview({url:video.output_url,title:form.title,path:video.output_path})}>预览视频</Button><Button quiet className="draft-delete" onClick={remove}>{video.output_exists?"删除记录":"删除无效记录"}</Button><Button primary disabled={busy} onClick={submit}>{busy?"处理中":targetMode==="group"?"加入分组发布队列":"加入账号发布队列"}</Button></div>
       </section>
       <label className="schedule-delete"><input type="checkbox" checked={form.delete_after_publish} onChange={event=>setForm({...form,delete_after_publish:event.target.checked})}/>全部成功后删除本地视频</label>

@@ -72,6 +72,7 @@ LIMITS = {
 ERROR_DEFINITIONS = {
     "AUTH_EXPIRED": ("登录状态已失效", "请重新登录平台账号后再发布", True, True, False),
     "ACCOUNT_NOT_FOUND": ("发布账号不存在", "所选账号已删除、停用或与平台不匹配", False, False, True),
+    "ACCOUNT_PLATFORM_MISMATCH": ("当前账号未绑定视频号", "请重新登录绑定", False, True, True),
     "PLATFORM_UNTESTED": ("平台尚未完成真实发布测试", "普通用户暂时不能使用该平台发布，仅管理员可执行验收", False, False, True),
     "FILE_NOT_FOUND": ("视频文件不存在", "请检查输出目录或重新生成视频", False, False, False),
     "FILE_UNREADABLE": ("视频文件无法读取", "文件可能被占用或当前用户没有读取权限", True, False, False),
@@ -85,6 +86,12 @@ ERROR_DEFINITIONS = {
     "SUBMIT_FAILED": ("发布提交失败", "平台拒绝提交或必填项尚未完成", True, False, True),
     "PROCESSING_FAILED": ("平台处理失败", "上传后平台转码或审核前处理失败", True, False, True),
     "PAGE_CHANGED": ("当前平台页面可能已经更新", "关键页面元素缺失，已停止操作，请更新发布适配器", False, False, True),
+    "ELEMENT_NOT_FOUND": ("页面控件未找到", "视频号发布页面缺少必要控件", True, False, True),
+    "TIMEOUT": ("平台响应超时", "视频号页面在规定时间内没有完成响应", True, False, True),
+    "PUBLISH_CLICK_FAILED": ("发布按钮点击失败", "视频号未接受发布操作", True, False, True),
+    "PUBLISH_FAILED": ("视频号发布失败", "平台未完成发布", True, False, True),
+    "VIDEO_UPLOAD_TIMEOUT": ("视频上传超时", "视频在规定时间内未完成上传", True, False, True),
+    "VIDEO_UPLOAD_NOT_STARTED": ("视频上传未开始", "文件注入后未观察到上传状态或视频预览", True, False, True),
     "CAPTCHA_REQUIRED": ("需要完成平台安全验证", "请在浏览器中完成验证码或扫码后继续", True, False, True),
     "MANUAL_CONFIRM_REQUIRED": ("需要人工确认", "平台要求手机确认、扫码或人工选择必填项", True, False, True),
     "DUPLICATE_TASK": ("该视频正在发布", "检测到相同账号、视频、标题和发布时间的任务，请勿重复操作", False, False, False),
@@ -132,6 +139,11 @@ def guarded_error(code: str, detail: str = "") -> PublishGuardError:
 def map_publish_exception(exc: Exception) -> PublishGuardError:
     if isinstance(exc, PublishGuardError):
         return exc
+    # Keep the failure category instead of collapsing every browser exception
+    # into PAGE_CHANGED; PAGE_CHANGED is reserved for a confirmed DOM rollout.
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    if isinstance(exc, PlaywrightTimeoutError):
+        return guarded_error("TIMEOUT")
     text = str(exc or "")
     lowered = text.lower()
     if any(word in lowered for word in ("401", "unauthorized", "login expired", "登录过期", "登录失效", "cookie expired")):
@@ -146,15 +158,67 @@ def map_publish_exception(exc: Exception) -> PublishGuardError:
         return guarded_error("UPLOAD_FAILED")
     if any(word in lowered for word in ("submit failed", "提交失败", "publish rejected")):
         return guarded_error("SUBMIT_FAILED")
+    if "未取得真实作品id" in lowered or "未取得真实作品链接" in lowered:
+        return guarded_error("MANUAL_CONFIRM_REQUIRED", "平台可能已经发布，但软件未能取得作品凭证，请先核对抖音内容管理后台")
     if any(word in lowered for word in ("processing failed", "transcode failed", "处理失败", "转码失败")):
         return guarded_error("PROCESSING_FAILED")
     if any(word in lowered for word in ("timeout", "timed out", "网络")):
         return guarded_error("NETWORK_TIMEOUT")
     if any(word in lowered for word in ("target closed", "browser has been closed", "crash")):
         return guarded_error("BROWSER_CRASHED")
-    if any(word in lowered for word in ("locator", "selector", "element", "页面元素")):
+    if "selector changed" in lowered or "dom changed" in lowered or "页面结构变化" in lowered:
         return guarded_error("PAGE_CHANGED")
+    if any(word in lowered for word in ("locator", "selector missing", "element", "element not found", "页面元素")):
+        return guarded_error("ELEMENT_NOT_FOUND")
     return guarded_error("UNKNOWN_ERROR")
+
+
+def preflight_douyin_publish_check(
+    platform: dict,
+    account: dict,
+    video_path: str,
+    metadata: dict,
+    *,
+    check_network: bool = True,
+) -> dict:
+    """Narrow preflight for the already-validated Douyin browser adapter."""
+    if str(platform.get("code") or platform.get("platform_code") or "") != "douyin":
+        raise ValueError("该预检仅用于抖音")
+    if str(platform.get("capability_status") or "") != "passed":
+        raise guarded_error("PLATFORM_UNTESTED", "抖音发布验收状态异常")
+    if not account or int(account.get("id") or 0) <= 0 or str(account.get("status") or "active") != "active":
+        raise guarded_error("ACCOUNT_NOT_FOUND", "抖音发布账号不存在")
+    if str(account.get("login_status") or "") != "logged_in":
+        raise guarded_error("AUTH_EXPIRED", "抖音账号尚未登录")
+    profile = Path(str(account.get("browser_profile_path") or "")).expanduser()
+    if not profile.is_dir():
+        raise guarded_error("AUTH_EXPIRED", "抖音账号登录环境不存在，请重新登录")
+    path = Path(str(video_path or "")).expanduser()
+    if not path.is_file():
+        raise guarded_error("FILE_NOT_FOUND")
+    if not os.access(path, os.R_OK):
+        raise guarded_error("FILE_UNREADABLE")
+    try:
+        with path.open("rb") as stream:
+            stream.read(1)
+    except OSError as exc:
+        raise guarded_error("FILE_UNREADABLE") from exc
+    video_info = _probe_video(path)
+    title = str(metadata.get("title") or "").strip()
+    if not title or len(title) > 30:
+        raise guarded_error("TITLE_TOO_LONG", "抖音标题应为1至30个字符")
+    cover = _validate_cover(metadata.get("cover_path") or "")
+    if check_network:
+        default_network_check("https://creator.douyin.com/creator-micro/content/upload")
+    video_digest = quick_hash(path)
+    title_digest = title_hash(title)
+    return {
+        "platform": "douyin", "account_id": int(account["id"]),
+        "video_path": str(path.resolve()), "video_file_hash": video_digest,
+        "title_hash": title_digest,
+        "idempotency_key": idempotency_key("douyin", int(account["id"]), video_digest, title_digest, str(metadata.get("schedule") or "")),
+        "cover_path": cover, "video": video_info, "status": "ready",
+    }
 
 
 def title_hash(title: str) -> str:
@@ -178,7 +242,8 @@ def _probe_video(path: Path, configured_ffprobe: str = "") -> dict:
     ]
     try:
         process = subprocess.run(command, capture_output=True, text=True, timeout=20,
-                                 encoding="utf-8", errors="replace", **background_process_kwargs())
+                                 encoding="utf-8", errors="replace",
+                                 **background_process_kwargs(command, "publish_video_probe"))
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise guarded_error("VIDEO_INVALID", "FFprobe执行失败") from exc
     if process.returncode != 0:
@@ -259,8 +324,6 @@ def preflight_publish_check(
     if code not in GUARDED_DOMESTIC_PLATFORMS:
         raise ValueError("该预检仅用于快手、小红书、视频号和B站")
     name = PLATFORM_NAMES[code]
-    if not allow_unverified and platform.get("capability_status") != "passed":
-        raise guarded_error("PLATFORM_UNTESTED", f"{name}尚未完成真实发布验收")
     if not account or int(account.get("id") or 0) <= 0 or str(account.get("status") or "active") != "active":
         raise guarded_error("ACCOUNT_NOT_FOUND", f"{name}发布账号不存在")
     if int(account.get("platform_id") or 0) != int(platform.get("id") or account.get("platform_id") or 0):
@@ -294,9 +357,9 @@ def preflight_publish_check(
     cover = _validate_cover(metadata.get("cover_path") or "")
     scheduled = _validate_schedule(metadata.get("schedule") or metadata.get("scheduled_at") or "")
     if scheduled:
-        raise guarded_error("SUBMIT_FAILED", f"{name}定时发布尚未完成真实验收，当前版本不允许静默忽略该设置")
+        raise guarded_error("SUBMIT_FAILED", f"当前{name}浏览器发布暂不支持定时发布")
     if str(metadata.get("visibility") or "").strip():
-        raise guarded_error("MANUAL_CONFIRM_REQUIRED", f"{name}可见范围控件尚未完成真实验收，请先更新适配器")
+        raise guarded_error("MANUAL_CONFIRM_REQUIRED", f"请在{name}发布页确认可见范围")
     from publishers import get_publisher
     try:
         publisher = get_publisher(code)
@@ -329,7 +392,7 @@ def preflight_publish_check(
 def status_for_error(error: PublishGuardError) -> str:
     if error.code in {"AUTH_EXPIRED"}:
         return "needs_login"
-    if error.code in {"CAPTCHA_REQUIRED", "MANUAL_CONFIRM_REQUIRED", "PAGE_CHANGED", "BROWSER_CRASHED", "DUPLICATE_TASK"}:
+    if error.code in {"ACCOUNT_PLATFORM_MISMATCH", "CAPTCHA_REQUIRED", "MANUAL_CONFIRM_REQUIRED", "PAGE_CHANGED", "BROWSER_CRASHED", "DUPLICATE_TASK"}:
         return "needs_manual_action"
     return "failed"
 
@@ -343,7 +406,11 @@ def recover_guarded_channels() -> int:
     with connect() as conn:
         rows = conn.execute(
             f"""SELECT c.id,c.publish_task_id FROM publish_channels c JOIN platforms p ON p.id=c.platform_id
-                WHERE p.code IN ({guarded}) AND c.status IN ({marks})""",
+                WHERE p.code IN ({guarded}) AND c.status IN ({marks})
+                AND NOT (p.code='wechat_channels' AND c.status='processing'
+                    AND json_valid(c.result_evidence_json)
+                    AND json_extract(c.result_evidence_json,'$.submitted')=1
+                    AND json_extract(c.result_evidence_json,'$.confirmation_job') IS NOT NULL)""",
             (*sorted(GUARDED_DOMESTIC_PLATFORMS), *sorted(interrupted)),
         ).fetchall()
         for item in rows:

@@ -1,4 +1,5 @@
 import React, {useEffect, useMemo, useRef, useState} from "react";
+import {createPortal} from "react-dom";
 
 const PLATFORM_NAMES = {
   douyin: "抖音",
@@ -13,15 +14,6 @@ const PLATFORM_NAMES = {
   x: "X",
 };
 
-const CAPABILITY_TEXT = {
-  passed: "已验证",
-  untested: "待验收",
-  testing: "测试中",
-  failed: "测试失败",
-  limited: "部分可用",
-  not_implemented: "未实现",
-};
-
 export function platformName(platform) {
   return PLATFORM_NAMES[platform?.code] || platform?.name || "平台";
 }
@@ -33,7 +25,7 @@ function groupName(platform) {
 
 function accessText(platform) {
   const access = platform?.integration_type === "api" ? "官方 API" : "独立浏览器";
-  const status = CAPABILITY_TEXT[platform?.capability_status] || "待配置";
+  const status = platform?.integration_type === "api" ? "需要授权" : "登录后可用";
   return `${access} · ${status}`;
 }
 
@@ -55,10 +47,12 @@ export default function PlatformSelect({
   compact=false,
 }) {
   const rootRef = useRef(null);
+  const popoverRef = useRef(null);
   const searchRef = useRef(null);
   const [open,setOpen] = useState(false);
   const [query,setQuery] = useState("");
   const [activeIndex,setActiveIndex] = useState(0);
+  const [popoverStyle,setPopoverStyle] = useState({});
   const selected = platforms.find(item=>String(item.id)===String(value) || item.code===value);
   const normalized = query.trim().toLowerCase();
   const filtered = useMemo(()=>platforms.filter(item=>{
@@ -78,10 +72,25 @@ export default function PlatformSelect({
   },[options]);
 
   useEffect(()=>{
-    const close=event=>{if(!rootRef.current?.contains(event.target))setOpen(false)};
+    const close=event=>{if(!rootRef.current?.contains(event.target)&&!popoverRef.current?.contains(event.target))setOpen(false)};
     document.addEventListener("mousedown",close);
     return()=>document.removeEventListener("mousedown",close);
   },[]);
+  useEffect(()=>{
+    if(!open)return;
+    const updatePosition=()=>{
+      const rect=rootRef.current?.getBoundingClientRect();
+      if(!rect)return;
+      const maxHeight=Math.min(300,Math.max(180,window.innerHeight-24));
+      const spaceBelow=window.innerHeight-rect.bottom-12;
+      const openUp=spaceBelow<220&&rect.top>spaceBelow;
+      setPopoverStyle({left:Math.max(8,Math.min(rect.left,window.innerWidth-rect.width-8)),width:Math.max(rect.width,220),maxHeight, ...(openUp?{bottom:window.innerHeight-rect.top+6}:{top:rect.bottom+6})});
+    };
+    updatePosition();
+    window.addEventListener("resize",updatePosition);
+    window.addEventListener("scroll",updatePosition,true);
+    return()=>{window.removeEventListener("resize",updatePosition);window.removeEventListener("scroll",updatePosition,true)};
+  },[open]);
   useEffect(()=>{if(open){setQuery("");setActiveIndex(0);requestAnimationFrame(()=>searchRef.current?.focus())}},[open]);
 
   const choose=item=>{
@@ -103,12 +112,12 @@ export default function PlatformSelect({
       <span className="platform-select-value"><b>{selected?platformName(selected):(displayAll?allLabel:placeholder)}</b>{selected&&!compact&&<small>{accessText(selected)}</small>}</span>
       <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg>
     </button>
-    {open&&<div className="platform-select-popover">
+    {open&&createPortal(<div ref={popoverRef} className="platform-select-popover platform-select-popover-portal" style={popoverStyle}>
       <label className="platform-select-search"><svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="m13 13 4 4"/></svg><input ref={searchRef} value={query} onChange={event=>{setQuery(event.target.value);setActiveIndex(0)}} placeholder="搜索平台"/></label>
       <div className="platform-select-options" role="listbox">
         {grouped.map(group=><section key={group.title||"all"}>{group.title&&<h4>{group.title}</h4>}{group.items.map(item=>{const index=options.indexOf(item);const current=item._all?displayAll:String(item.id)===String(value);return <button type="button" role="option" aria-selected={current} className={`${current?"selected":""} ${activeIndex===index?"active":""}`} key={item._all?"all":item.id} onMouseEnter={()=>setActiveIndex(index)} onClick={()=>choose(item)}>{item._all?<span className="platform-mark platform-all">全</span>:<PlatformMark platform={item}/>}<span><b>{item._all?allLabel:platformName(item)}</b>{!item._all&&<small>{accessText(item)}</small>}</span>{current&&<i>✓</i>}</button>})}</section>)}
         {!options.length&&<p>没有匹配的平台</p>}
       </div>
-    </div>}
+    </div>,document.body)}
   </div>;
 }

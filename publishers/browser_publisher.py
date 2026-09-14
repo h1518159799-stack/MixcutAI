@@ -7,7 +7,7 @@ import json
 
 from playwright.sync_api import sync_playwright
 
-from browser_profile_service import find_chromium
+from browser_profile_service import find_chromium, find_system_browser
 from .base import Publisher
 
 
@@ -26,6 +26,111 @@ SUCCESS_TEXTS = {
 }
 
 ERROR_TEXTS = ("发布失败", "上传失败", "网络异常", "请重试", "Upload failed", "Couldn't upload")
+TIKTOK_PUBLISH_LABELS = ("发布", "Post", "Publish")
+
+
+def _tiktok_visible_button_snapshot(page) -> list[dict]:
+    """Return a safe DOM snapshot used for resilient TikTok button discovery."""
+    return page.locator("button, [role='button']").evaluate_all("""
+        nodes => nodes.map((node, index) => {
+          const rect = node.getBoundingClientRect();
+          const style = getComputedStyle(node);
+          const text = (node.innerText || node.textContent || '').replace(/\\s+/g, ' ').trim();
+          return {index, text, tag: node.tagName.toLowerCase(),
+            testid: node.getAttribute('data-testid') || '',
+            disabled: !!node.disabled || node.getAttribute('aria-disabled') === 'true',
+            visible: !!(rect.width && rect.height) && style.visibility !== 'hidden' && style.display !== 'none',
+            x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+        }).filter(item => item.visible)
+    """)
+
+
+def _tiktok_button_is_covered(page, index: int) -> bool:
+    return bool(page.locator("button, [role='button']").nth(index).evaluate("""
+        node => { const r = node.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return !!hit && hit !== node && !node.contains(hit); }
+    """))
+
+
+def find_tiktok_publish_button(page):
+    """Find a usable TikTok publish control without relying on one locale/selector."""
+    nodes = _tiktok_visible_button_snapshot(page)
+    labels = tuple(label.casefold() for label in TIKTOK_PUBLISH_LABELS)
+    ranked = []
+    for item in nodes:
+        text = item["text"].casefold()
+        testid = item["testid"].casefold()
+        score = 0
+        if any(label == text or label in text for label in labels): score += 100
+        if any(key in testid for key in ("publish", "post", "submit")): score += 60
+        if item["tag"] == "button": score += 20
+        if not item["disabled"]: score += 10
+        if score: ranked.append((score, item))
+    for _score, item in sorted(ranked, key=lambda pair: (pair[0], pair[1]["y"]), reverse=True):
+        locator = page.locator("button, [role='button']").nth(item["index"])
+        if item["disabled"] or _tiktok_button_is_covered(page, item["index"]):
+            continue
+        return locator
+    return None
+
+
+def wait_for_tiktok_publish_button(page, artifact_dir: Path | None = None, timeout_seconds: int = 60):
+    """Wait up to 60s, rescanning every 2s, and persist diagnostics on failure."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        button = find_tiktok_publish_button(page)
+        if button is not None:
+            return button
+        page.wait_for_timeout(2000)
+    if artifact_dir:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        (artifact_dir / "tiktok_publish_button_diagnostics.json").write_text(json.dumps({
+            "url": page.url, "title": page.title(),
+            "buttons": page.locator("button, [role='button']").evaluate_all("""
+                nodes => nodes.map(n => ({text: (n.innerText || n.textContent || '').trim(),
+                testid: n.getAttribute('data-testid') || '', role: n.getAttribute('role') || '',
+                disabled: !!n.disabled, visible: !!(n.offsetWidth || n.offsetHeight)}))
+            """),
+            "visible_buttons": _tiktok_visible_button_snapshot(page),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        page.screenshot(path=str(artifact_dir / "tiktok_publish_button_diagnostics.png"), full_page=True)
+    raise RuntimeError("TikTok发布按钮未找到，已保存定位诊断")
+
+
+def extract_douyin_work_items(payload: dict) -> list[dict]:
+    result = []
+    for item in payload.get("aweme_list") or []:
+        work_id = str(item.get("aweme_id") or item.get("item_id") or "").strip()
+        title_value = str(item.get("item_title") or item.get("desc") or "").strip()
+        share_url = str(item.get("share_url") or "").strip()
+        if work_id and title_value:
+            result.append({"id": work_id, "title": title_value, "url": share_url,
+                           "create_time": int(item.get("create_time") or 0),
+                           "duration": float(item.get("duration") or 0) / 1000.0})
+    return result
+
+
+def match_douyin_work(items: list[dict], expected_title: str, *, excluded_ids=(), created_after: int = 0,
+                       expected_duration: float = 0):
+    expected = re.sub(r"\s+", " ", str(expected_title or "").strip())
+    excluded = {str(value) for value in excluded_ids}
+    candidates = []
+    for item in items:
+        item_title = re.sub(r"\s+", " ", item["title"])
+        if item["id"] in excluded or int(item.get("create_time") or 0) < int(created_after or 0):
+            continue
+        item_duration = float(item.get("duration") or 0)
+        if expected_duration and item_duration and abs(item_duration - expected_duration) > 1.5:
+            continue
+        if item_title == expected or item_title.startswith(expected) or expected.startswith(item_title):
+            candidates.append(item)
+    if not candidates:
+        return None
+    result = max(candidates, key=lambda value: int(value.get("create_time") or 0))
+    if not result.get("url"):
+        result = {**result, "url": f"https://www.douyin.com/video/{result['id']}"}
+    return result
 
 
 class BrowserPublisher(Publisher):
@@ -54,10 +159,42 @@ class BrowserPublisher(Publisher):
         screenshots: list[str] = []
         evidence: dict[str, str] = {}
         browser_log: list[dict] = []
+        state_callback = metadata.get("state_callback")
+        current_stage = "prechecking"
+
+        def set_stage(stage: str) -> None:
+            nonlocal current_stage
+            current_stage = stage
+            if callable(state_callback):
+                state_callback(stage)
+
+        # Douyin's current creator page renders works as JavaScript cards and
+        # no longer exposes public /video/ anchors in the DOM.  The page's own
+        # work-list response is the authoritative source for aweme_id and the
+        # share URL, so keep only the returned work metadata (never cookies or
+        # request headers).
+        douyin_work_items: list[dict] = []
+
+        def remember_douyin_works(response) -> None:
+            if self.platform_code != "douyin" or "/janus/douyin/creator/pc/work_list" not in response.url:
+                return
+            try:
+                payload = response.json()
+            except Exception:
+                return
+            douyin_work_items.extend(extract_douyin_work_items(payload))
+
+        def find_douyin_work(expected_title: str, *, excluded_ids=(), created_after: int = 0):
+            return match_douyin_work(
+                douyin_work_items, expected_title, excluded_ids=excluded_ids,
+                created_after=created_after,
+                expected_duration=float(metadata.get("video_duration") or 0),
+            )
 
         with sync_playwright() as playwright:
+            browser_executable = find_system_browser() if self.platform_code == "tiktok" else find_chromium()
             context = playwright.chromium.launch_persistent_context(
-                str(profile), executable_path=str(find_chromium()), headless=True,
+                str(profile), executable_path=str(browser_executable), headless=True,
                 viewport={"width": 1280, "height": 820}, args=["--no-first-run"],
             )
             try:
@@ -67,6 +204,7 @@ class BrowserPublisher(Publisher):
                     "type": message.type,
                     "text": message.text,
                 }))
+                page.on("response", remember_douyin_works)
 
                 def capture(step: str) -> None:
                     if not artifact_dir:
@@ -88,15 +226,33 @@ class BrowserPublisher(Publisher):
                     evidence[f"{step}_state"] = str(state_path)
 
                 baseline_count = None
+                baseline_work_ids: set[str] = set()
                 if self.platform_code == "douyin":
                     page.goto("https://creator.douyin.com/creator-micro/content/manage", wait_until="domcontentloaded", timeout=90_000)
                     page.wait_for_timeout(3000)
-                    match = re.search(r"共\s*(\d+)\s*个作品", page.locator("body").inner_text())
+                    body_text = page.locator("body").inner_text()
+                    if "登录" in body_text[:800] and not douyin_work_items:
+                        raise RuntimeError("抖音账号登录状态已失效")
+                    match = re.search(r"共\s*(\d+)\s*个作品", body_text)
                     baseline_count = int(match.group(1)) if match else None
+                    baseline_work_ids = {item["id"] for item in douyin_work_items}
+                    recovery_after = int(metadata.get("recover_existing_after") or 0)
+                    if recovery_after:
+                        recovered = find_douyin_work(title, created_after=max(0, recovery_after - 300))
+                        if recovered:
+                            capture("00_existing_publication_confirmed")
+                            return {
+                                "id": recovered["id"], "url": recovered["url"],
+                                "verified": True, "backend_confirmed": True,
+                                "signal": "内容管理后台已找到原发布作品",
+                                "recovered_existing": True, "screenshots": screenshots,
+                                "artifacts": evidence,
+                            }
                 page.goto(upload_url, wait_until="domcontentloaded", timeout=90_000)
                 capture("01_upload_page")
                 file_input = page.locator('input[type="file"]').first
                 file_input.wait_for(state="attached", timeout=90_000)
+                set_stage("uploading")
                 file_input.set_input_files(str(video_path.resolve()))
                 if self.platform_code == "douyin":
                     title_field = page.locator('input[placeholder*="作品标题"]').first
@@ -150,20 +306,51 @@ class BrowserPublisher(Publisher):
                         except Exception:
                             continue
                 capture("02_metadata_filled")
-                publish_button = page.locator('button:visible').filter(has_text="发布").last
-                publish_button.wait_for(state="visible", timeout=300_000)
-                # Do not click while the platform is still processing the file.
-                deadline = time.time() + 300
-                while time.time() < deadline and publish_button.is_disabled():
-                    page.wait_for_timeout(1000)
-                if publish_button.is_disabled():
-                    raise RuntimeError("视频仍在上传处理中，平台发布按钮未启用")
-                publish_button.click()
+                if self.platform_code == "tiktok":
+                    # TikTok changes labels/roles across locales and upload
+                    # phases.  Wait for the upload UI to settle, then rescan
+                    # the live DOM instead of keeping a stale locator.
+                    upload_deadline = time.time() + 60
+                    while time.time() < upload_deadline:
+                        body = page.locator("body").inner_text().casefold()
+                        processing = any(marker in body for marker in ("uploading", "processing", "上传中", "处理中"))
+                        description_present = bool(description_text) and bool(page.locator("textarea, [contenteditable='true']").count())
+                        if not processing and (description_present or not description_text):
+                            break
+                        page.wait_for_timeout(2000)
+                    publish_button = wait_for_tiktok_publish_button(page, artifact_dir, timeout_seconds=60)
+                    if publish_button.is_disabled():
+                        raise RuntimeError("TikTok发布按钮仍未启用，视频可能尚未上传完成")
+                else:
+                    publish_button = page.locator('button:visible').filter(has_text="发布").last
+                    publish_button.wait_for(state="visible", timeout=300_000)
+                    # Do not click while the platform is still processing the file.
+                    deadline = time.time() + 300
+                    while time.time() < deadline and publish_button.is_disabled():
+                        page.wait_for_timeout(1000)
+                    if publish_button.is_disabled():
+                        raise RuntimeError("视频仍在上传处理中，平台发布按钮未启用")
+                set_stage("submitting")
+                try:
+                    publish_button.scroll_into_view_if_needed()
+                    publish_button.click(timeout=5000)
+                except Exception:
+                    if self.platform_code != "tiktok":
+                        raise
+                    # A transient overlay can win hit-testing between scan and
+                    # click. Re-scan after the overlay settles; never force-click.
+                    page.wait_for_timeout(2000)
+                    publish_button = wait_for_tiktok_publish_button(page, artifact_dir, timeout_seconds=60)
+                    publish_button.click(timeout=5000)
                 capture("03_publish_clicked")
                 # Keep the browser visible until the platform itself confirms
                 # publication. A click, URL change or closed dialog is not proof.
                 deadline = time.time() + 600
                 success_text = ""
+                # Immediate publish no longer enters the retired manual
+                # confirmation state; keep the task in processing until the
+                # platform returns its verified work id and URL.
+                set_stage("processing")
                 while time.time() < deadline:
                     for text in ERROR_TEXTS:
                         marker = page.get_by_text(text, exact=False).first
@@ -219,6 +406,21 @@ class BrowserPublisher(Publisher):
                 # page or the creator content list; never fabricate one.
                 work_url = ""
                 work_id = ""
+                if self.platform_code == "douyin":
+                    # A success toast may arrive before the page loads content
+                    # management.  Always query the actual work list and match
+                    # the newly created title, excluding everything that was
+                    # present before upload.
+                    if "/content/manage" not in page.url:
+                        page.goto("https://creator.douyin.com/creator-micro/content/manage", wait_until="domcontentloaded", timeout=90_000)
+                    deadline = time.time() + 180
+                    while time.time() < deadline:
+                        page.wait_for_timeout(1500)
+                        matched_work = find_douyin_work(title, excluded_ids=baseline_work_ids)
+                        if matched_work:
+                            work_id, work_url = matched_work["id"], matched_work["url"]
+                            break
+                        page.reload(wait_until="domcontentloaded", timeout=90_000)
                 url_patterns = {
                     "douyin": r"https?://(?:www\.)?douyin\.com/video/(\d+)",
                     "xiaohongshu": r"https?://(?:www\.)?xiaohongshu\.com/(?:explore|discovery/item)/([0-9a-fA-F]+)",
@@ -234,7 +436,7 @@ class BrowserPublisher(Publisher):
                         href = links.nth(index).get_attribute("href")
                         if href:
                             candidate_urls.append(href)
-                if pattern:
+                if pattern and not work_id:
                     for candidate in candidate_urls:
                         match = re.search(pattern, candidate)
                         if match:
@@ -247,7 +449,9 @@ class BrowserPublisher(Publisher):
                     log_path.write_text(json.dumps(browser_log, ensure_ascii=False, indent=2), encoding="utf-8")
                     evidence["browser_log"] = str(log_path)
                 return {
-                    "id": work_id, "url": work_url, "verified": True, "signal": success_text,
+                    "id": work_id, "url": work_url, "verified": True,
+                    "backend_confirmed": self.platform_code == "douyin",
+                    "signal": success_text, "stage": current_stage,
                     "screenshots": screenshots, "artifacts": evidence,
                 }
             except Exception:

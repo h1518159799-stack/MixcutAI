@@ -100,6 +100,7 @@ class PlatformAdapterTests(unittest.TestCase):
         task_id = create_publish_task({
             "generation_task_id": generation_task_id,
             "account_ids": [account_id],
+            "platform": "douyin",
             "title": "测试标题",
             "description": "测试描述",
             "tags": "#工厂 #OEM 工厂",
@@ -122,7 +123,7 @@ class PlatformAdapterTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             get_publisher("youtube").publish("video.mp4", {}, {})
 
-    def test_untested_platform_cannot_enter_production_queue(self):
+    def test_api_platform_still_requires_oauth_regardless_of_acceptance_metadata(self):
         video = self.root / "youtube-test.mp4"
         video.write_bytes(b"video")
         with db.connect() as conn:
@@ -136,10 +137,11 @@ class PlatformAdapterTests(unittest.TestCase):
         account_id = commercial_api.save_publishing_account({
             "platform_id": platform["id"], "account_name": "待验收 YouTube", "oauth_client_id": "client-id"
         })
-        with self.assertRaisesRegex(ValueError, "平台尚未完成测试"):
+        with self.assertRaisesRegex(ValueError, "请先完成平台授权"):
             create_publish_task({
                 "generation_task_id": generation_task_id,
                 "account_ids": [account_id],
+                "platform": "youtube",
                 "title": "不能进入正式发布",
             })
 

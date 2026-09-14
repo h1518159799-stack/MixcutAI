@@ -1,0 +1,10 @@
+{
+  "customers": [
+    {
+      "id": "customer_demo",
+      "token_sha256": "b34f246924772503373042b2947c45a7a03ebebb27d300fcb8a80d7386e96048",
+      "requests_per_minute": 60,
+      "enabled": false
+    }
+  ]
+}

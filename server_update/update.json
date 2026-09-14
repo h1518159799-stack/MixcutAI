@@ -1,8 +1,20 @@
 {
-  "version": "1.3.12",
-  "title": "Mixcut AI v1.3.12",
-  "content": "Fix Xiaohongshu and WeChat Channels persistent browser login lifecycle and automatic status refresh",
-  "download_url": "https://47-107-104-106.sslip.io/updates/MixcutAI.exe",
-  "sha256": "d4879ab5d33381650e28b8e07eb50fefd6ef9ce730179fef0f5e26c8d33322ee",
-  "force_update": false
+  "version": "1.3.27",
+  "download_url": "https://update.ghwc.cn/MixcutAI-v1.3.27.exe",
+  "sha256": "6186498dbe9b20c83e3ba39b7ba289bda038c59185842ee4fc96432b66a68d59",
+  "file_size": 82657556,
+  "release_notes": "正式授权与更新域名迁移，并包含当前稳定功能修复。",
+  "updater_version": "1.3.27",
+  "force_update": false,
+  "updater": {
+    "url": "https://update.ghwc.cn/MixcutUpdater.exe",
+    "sha256": "23323b3f74704e1ebc07787ac1a62966de2ea520b912740b5ba8a85048933b8c",
+    "file_size": 10036778,
+    "size_bytes": 10036778
+  },
+  "runtime_version": "8.1.2",
+  "runtime_url": "https://update.ghwc.cn/runtime/runtime_manifest.json",
+  "title": "Mixcut AI v1.3.27",
+  "content": "正式授权与更新域名迁移，并包含当前稳定功能修复。",
+  "size_bytes": 82657556
 }

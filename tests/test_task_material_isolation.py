@@ -35,12 +35,18 @@ class TaskMaterialIsolationTests(unittest.TestCase):
                     material_start_time REAL, material_end_time REAL,
                     created_at TEXT, updated_at TEXT
                 );
+                CREATE TABLE generation_tasks (
+                    id INTEGER PRIMARY KEY, status TEXT, created_at TEXT,
+                    updated_at TEXT, finished_at TEXT
+                );
                 INSERT INTO template_shots VALUES(1,7,'shot','show new product','',1,'voice.wav',3,0,'',5);
                 INSERT INTO materials VALUES(10,'old.mp4','old.mp4',10,1080,1920,5,'active');
                 INSERT INTO materials VALUES(11,'new.mp4','new.mp4',10,1080,1920,5,'active');
                 INSERT INTO material_categories VALUES(5,'factory');
                 INSERT INTO generation_shot_materials VALUES(1,100,1,10,3,1,4,'','');
                 INSERT INTO generation_shot_materials VALUES(2,101,1,11,3,5,8,'','');
+                INSERT INTO generation_tasks VALUES(100,'completed','','','2026-01-01 10:00:00');
+                INSERT INTO generation_tasks VALUES(101,'failed','','','2026-01-01 11:00:00');
                 """
             )
 

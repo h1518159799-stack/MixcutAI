@@ -20,7 +20,7 @@ from typing import Callable, Iterable
 from urllib.parse import quote
 
 from db import DATA_DIR, connect, now
-from runtime_paths import MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
+from runtime_paths import LOG_DIR, MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
 from subprocess_utils import background_process_kwargs
 from video_scan import VIDEO_EXTS, quick_hash
 
@@ -123,7 +123,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console
     result = subprocess.run(
         ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded],
         capture_output=True, text=True, timeout=300, encoding="utf-8", errors="ignore",
-        **background_process_kwargs(),
+        **background_process_kwargs(["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded], "smart_split_folder_dialog"),
     )
     return (result.stdout or "").strip()
 
@@ -149,7 +149,7 @@ def probe_video(source_path: str | Path, ffprobe_path: str = "") -> dict:
     ]
     result = subprocess.run(
         command, capture_output=True, text=True, timeout=30,
-        encoding="utf-8", errors="replace", **background_process_kwargs(),
+        encoding="utf-8", errors="replace", **background_process_kwargs(command, "smart_split_probe"),
     )
     if result.returncode != 0:
         raise SmartSplitError("视频文件损坏或 FFprobe 无法解析")
@@ -291,7 +291,8 @@ def detect_scene_changes(
     ]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="replace", bufsize=1, **background_process_kwargs(),
+        encoding="utf-8", errors="replace", bufsize=1,
+        **background_process_kwargs(command, "smart_split_scene_detection"),
     )
     candidates: list[dict] = []
     pending_time: float | None = None
@@ -354,7 +355,8 @@ def generate_preview_thumbnails(job_id: int, source_path: str | Path, segments: 
             "-i", str(source_path), "-frames:v", "1", "-vf", "scale=320:-2:flags=lanczos",
             "-q:v", "3", str(output),
         ]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **background_process_kwargs())
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   **background_process_kwargs(command, "smart_split_thumbnail"))
         _set_process(job_id, process)
         stdout, stderr = process.communicate(timeout=45)
         _set_process(job_id, None)
@@ -462,7 +464,9 @@ def _detect_for_job(job_id: int, source: Path, threshold: float, min_gap: float,
         "-vf", f"scale=640:-2:flags=bilinear,select='gt(scene,{threshold:.4f})',metadata=print:file=-",
         "-an", "-f", "null", os.devnull,
     ]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1, **background_process_kwargs())
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                               encoding="utf-8", errors="replace", bufsize=1,
+                               **background_process_kwargs(command, "smart_split_detection"))
     _set_process(job_id, process)
     candidates: list[dict] = []
     pending_time: float | None = None
@@ -716,7 +720,8 @@ def _export_worker(job_id: int, output_root: str) -> None:
                 command += ["-an"]
             command += _export_video_options(int(job.get("source_width") or 0), int(job.get("source_height") or 0))
             command += ["-movflags", "+faststart", "-avoid_negative_ts", "make_zero", str(partial)]
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **background_process_kwargs())
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       **background_process_kwargs(command, "smart_split_export"))
             _set_process(job_id, process)
             _, stderr = process.communicate()
             _set_process(job_id, None)
@@ -780,13 +785,35 @@ def cancel_job(job_id: int) -> dict:
 
 def open_output_directory(job_id: int) -> dict:
     job = get_job(job_id)
-    output = Path(str(job.get("output_dir") or ""))
+    output = Path(str(job.get("output_dir") or "")).resolve()
+    log_path = LOG_DIR / "smart-split-open-folder.log"
+
+    def log_open(result: str, exception: str = "") -> None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "event": "open_folder_called", "job_id": int(job_id),
+                "folder_path": str(output), "result": result,
+                "exception": str(exception or ""), "timestamp": now(),
+            }
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
     if not output.is_dir():
+        log_open("failed", "输出目录不存在")
         raise SmartSplitError("输出目录不存在")
-    if os.name == "nt":
-        os.startfile(str(output))
-    else:
-        subprocess.Popen(["xdg-open", str(output)])
+    command = ["explorer.exe", str(output)] if os.name == "nt" else ["xdg-open", str(output)]
+    try:
+        subprocess.Popen(
+            command, close_fds=True,
+            **background_process_kwargs(command, "open_split_output"),
+        )
+    except OSError as exc:
+        log_open("failed", f"{type(exc).__name__}: {exc}")
+        raise SmartSplitError(f"无法打开输出目录：{exc}") from exc
+    log_open("opened")
     return {"opened": True, "path": str(output)}
 
 

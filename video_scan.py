@@ -62,7 +62,8 @@ def probe_video(path: Path, ffprobe_path: str = "") -> Dict:
         str(path),
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15, encoding="utf-8", errors="ignore", **background_process_kwargs())
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=15, encoding="utf-8", errors="ignore",
+                           **background_process_kwargs(cmd, "media_probe"))
         if p.returncode != 0:
             detail = (p.stderr or "").lower()
             result["error"] = "文件正在被其他程序占用" if "permission denied" in detail else "素材无法读取或视频格式异常"
@@ -106,7 +107,8 @@ def make_thumbnail_with_status(path: Path, file_hash: str, ffmpeg_path: str = ""
             "-frames:v", "1", "-vf", "scale=320:-1", str(out)
         ]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25, encoding="utf-8", errors="ignore", **background_process_kwargs())
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=25, encoding="utf-8", errors="ignore",
+                               **background_process_kwargs(cmd, "thumbnail_export"))
             if p.returncode == 0 and out.exists():
                 return str(out), ""
             return create_placeholder_thumbnail(path, out), "缩略图生成失败，已使用占位图"

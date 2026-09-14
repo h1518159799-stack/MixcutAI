@@ -14,7 +14,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import hashlib
 from pathlib import Path
+
+from subprocess_utils import background_process_kwargs
 
 
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -37,6 +40,7 @@ OUTPUT_DIR = APP_HOME / "outputs"
 LOG_DIR = DATA_DIR / "logs"
 TASK_LOG_DIR = LOG_DIR / "tasks"
 BROWSER_PROFILE_DIR = DATA_DIR / "browser_profiles"
+TIKTOK_PROFILE_DIR = APP_HOME / "browser_profiles" / "tiktok"
 BUNDLED_CHROMIUM_DIR = EXECUTABLE_DIR / "browser" / "chromium"
 BUNDLED_CHROMIUM_EXE = BUNDLED_CHROMIUM_DIR / "chrome.exe"
 BUNDLED_FFMPEG_DIR = EXECUTABLE_DIR / "runtime" / "ffmpeg" / "bin"
@@ -54,6 +58,38 @@ _VERSION_RE = re.compile(r"\bversion\s+([^\s]+)", re.IGNORECASE)
 
 class MediaRuntimeError(RuntimeError):
     """A required bundled media component is missing or cannot execute."""
+
+
+def clear_media_runtime_cache() -> None:
+    global _MEDIA_STATUS_CACHE
+    with _MEDIA_LOCK:
+        _MEDIA_STATUS_CACHE = None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest().lower()
+
+
+def _validate_local_runtime_manifest(ffmpeg: dict, ffprobe: dict) -> None:
+    manifest_path = EXECUTABLE_DIR / "runtime" / "ffmpeg" / "runtime_manifest.json"
+    if not manifest_path.is_file() or not ffmpeg["ok"] or not ffprobe["ok"]:
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        expected_version = str(manifest["ffmpeg_version"])
+        files = manifest["files"]
+        for item, relative in ((ffmpeg, "bin/ffmpeg.exe"), (ffprobe, "bin/ffprobe.exe")):
+            path = Path(item["path"])
+            if not str(item["version"]).startswith(expected_version):
+                item.update(ok=False, error=f"版本错误：需要 {expected_version}，实际 {item['version']}")
+            elif _sha256_file(path) != str(files[relative]).lower():
+                item.update(ok=False, error=f"文件损坏：SHA256校验失败；{path}")
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        ffmpeg.update(ok=False, error=f"runtime_manifest.json无效：{exc}")
 
 
 def ensure_runtime_dirs() -> None:
@@ -107,7 +143,8 @@ def _resolve_media_binary(kind: str) -> str:
         found = shutil.which(normalized) or shutil.which(binary_name)
         if found and Path(found).is_file():
             return str(Path(found).resolve())
-    raise MediaRuntimeError("视频处理组件缺失或损坏，请重新安装Mixcut Studio。")
+    candidates = "；".join(str(path) for path in _bundled_candidates(binary_name))
+    raise MediaRuntimeError(f"{('FFmpeg' if normalized == 'ffmpeg' else 'FFprobe')}不存在：已检查 {candidates}")
 
 
 def get_ffmpeg_path(*_legacy_args, **_legacy_kwargs) -> str:
@@ -125,26 +162,23 @@ def _component_status(kind: str) -> dict:
     try:
         path = get_ffmpeg_path() if kind == "ffmpeg" else get_ffprobe_path()
     except MediaRuntimeError as exc:
-        return {"name": label, "ok": False, "version": "", "bundled": FROZEN, "error": str(exc), "path": ""}
+        candidates = "；".join(str(path) for path in _bundled_candidates(kind + (".exe" if os.name == "nt" else "")))
+        return {"name": label, "ok": False, "exists": False, "version": "", "bundled": FROZEN, "error": str(exc), "path": candidates}
     try:
-        startupinfo = None
-        creationflags = 0
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = [path, "-version"]
         completed = subprocess.run(
-            [path, "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=15, startupinfo=startupinfo, creationflags=creationflags,
+            command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, **background_process_kwargs(command, "runtime_version_check"),
         )
         first_line = ((completed.stdout or completed.stderr or "").splitlines() or [""])[0]
         match = _VERSION_RE.search(first_line)
         version = match.group(1) if match else "未知版本"
         if completed.returncode != 0:
-            raise OSError(f"exit={completed.returncode}")
-        return {"name": label, "ok": True, "version": version, "bundled": FROZEN or "runtime" in Path(path).parts, "error": "", "path": path}
+            raise OSError(f"版本检测失败，退出码={completed.returncode}")
+        return {"name": label, "ok": True, "exists": True, "version": version, "bundled": FROZEN or "runtime" in Path(path).parts, "error": "", "path": path}
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"name": label, "ok": False, "version": "", "bundled": FROZEN, "error": f"组件无法运行：{type(exc).__name__}", "path": path}
+        error = str(exc) or type(exc).__name__
+        return {"name": label, "ok": False, "exists": Path(path).is_file(), "version": "", "bundled": FROZEN, "error": f"权限或版本错误：{error}", "path": path}
 
 
 def get_media_runtime_status(*, refresh: bool = False, include_paths: bool = False) -> dict:
@@ -154,11 +188,12 @@ def get_media_runtime_status(*, refresh: bool = False, include_paths: bool = Fal
         if refresh or _MEDIA_STATUS_CACHE is None:
             ffmpeg = _component_status("ffmpeg")
             ffprobe = _component_status("ffprobe")
+            _validate_local_runtime_manifest(ffmpeg, ffprobe)
             ready = bool(ffmpeg["ok"] and ffprobe["ok"])
             _MEDIA_STATUS_CACHE = {
                 "ready": ready,
                 "state": "ready" if ready else "error",
-                "message": "视频处理组件已内置，无需配置。" if ready else "视频处理组件缺失或损坏，请重新安装Mixcut Studio。",
+                "message": "视频处理组件已内置，无需配置。" if ready else "视频处理组件检测失败，请查看下方诊断信息。",
                 "ffmpeg": ffmpeg,
                 "ffprobe": ffprobe,
             }

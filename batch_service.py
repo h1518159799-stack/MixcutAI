@@ -105,7 +105,7 @@ def _batch_result(conn, batch_id: int, requested_count: int, *, duplicate: bool)
     }
 
 
-def create_batch_task(data: dict, *, detailed: bool = False) -> int | dict:
+def _create_batch_task_once(data: dict, *, detailed: bool = False) -> int | dict:
     created_tasks: list[tuple[int, str]] = []
     template_id = int(data.get("template_id") or 0)
     total_count = int(data.get("total_count") or 0)
@@ -238,6 +238,19 @@ def create_batch_task(data: dict, *, detailed: bool = False) -> int | dict:
     if not result:
         raise RuntimeError("批量任务创建失败：数据库没有返回有效任务")
     return result if detailed else int(result["batch_id"])
+
+
+def create_batch_task(data: dict, *, detailed: bool = False) -> int | dict:
+    """Retry the complete atomic batch transaction on transient SQLite locks."""
+    delays = (0.5, 1.0, 2.0, 4.0)
+    for attempt in range(5):
+        try:
+            return _create_batch_task_once(data, detailed=detailed)
+        except Exception as exc:
+            locked = "database is locked" in str(exc).lower() or "database table is locked" in str(exc).lower()
+            if not locked or attempt == 4:
+                raise
+            time.sleep(delays[attempt])
 
 
 def _canonical_item_status(value: object) -> str:

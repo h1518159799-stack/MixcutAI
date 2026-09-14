@@ -16,11 +16,13 @@
 
 ```powershell
 python issue_license.py --machine-id MX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX --type month
+python issue_license.py --machine-id MX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX --type day1
+python issue_license.py --machine-id MX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX --type day7
 python issue_license.py --machine-id MX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX --type year
 python issue_license.py --machine-id MX-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX --type permanent
 ```
 
-月卡、年卡可以通过 `--expire-date YYYY-MM-DD` 指定到期日。输出的 `MXLIC1...` 字符串就是可离线验证的签名授权凭证。
+1天卡、7天卡默认从签发即激活时刻精确计算24小时或7×24小时；月卡、年卡可以通过 `--expire-date YYYY-MM-DD` 指定到期日。输出的 `MXLIC1...` 字符串就是可离线验证的签名授权凭证。
 
 ## 密钥管理
 

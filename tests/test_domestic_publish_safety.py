@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import browser_profile_service
 import db
@@ -16,9 +16,28 @@ from publish_safety import (
 )
 from publishers import get_publisher
 from publishers.browser_publisher import BrowserPublisher
+from publishers.domestic_guarded import GuardedDomesticBrowserPublisher
 
 
 VALID_VIDEO = {"duration": 12.5, "size": 1024, "format": "mov,mp4,m4a", "codec": "h264", "width": 1080, "height": 1920}
+
+
+class BodyTextLocator:
+    def __init__(self, texts):
+        self.texts = texts
+
+    def all_inner_texts(self):
+        return self.texts
+
+
+class BodyTextPage:
+    def __init__(self, texts):
+        self.texts = texts
+
+    def locator(self, selector):
+        if selector != "body":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return BodyTextLocator(self.texts)
 
 
 class DomesticPublishSafetyTests(unittest.TestCase):
@@ -85,6 +104,40 @@ class DomesticPublishSafetyTests(unittest.TestCase):
         self.assertEqual(context.exception.code, code)
         self.assertTrue(context.exception.log_id.startswith("PUB-"))
 
+    def test_body_contains_supports_zero_one_and_multiple_body_nodes(self):
+        contains = GuardedDomesticBrowserPublisher._body_contains
+
+        self.assertEqual(contains(BodyTextPage([]), ("验证码",)), "")
+        self.assertEqual(contains(BodyTextPage(["发布页面 验证码"]), ("验证码",)), "验证码")
+        self.assertEqual(contains(BodyTextPage(["辅助页面", "视频号发布页面"]), ("发布页面",)), "发布页面")
+        self.assertEqual(contains(BodyTextPage(["辅助页面", "审核中"]), ("审核中",)), "审核中")
+        self.assertEqual(contains(BodyTextPage(["辅助页面", "视频号发布页面"]), ("登录失效",)), "")
+
+    def test_wechat_home_redirect_enters_video_editor(self):
+        publisher = GuardedDomesticBrowserPublisher("wechat_channels")
+        page = MagicMock()
+        page.url = "https://channels.weixin.qq.com/platform"
+        entry = MagicMock()
+        entry.is_visible.return_value = True
+        page.get_by_text.return_value.count.return_value = 1
+        page.get_by_text.return_value.nth.return_value = entry
+
+        with patch.object(publisher, "_file_input", side_effect=[None, object()]):
+            publisher._wait_for_wechat_editor(page, timeout=1)
+
+        page.get_by_text.assert_called_once_with("发表视频", exact=True)
+        entry.click.assert_called_once_with()
+
+    def test_wechat_ready_editor_does_not_click_home_entry(self):
+        publisher = GuardedDomesticBrowserPublisher("wechat_channels")
+        page = MagicMock()
+        page.url = "https://channels.weixin.qq.com/platform/post/create"
+
+        with patch.object(publisher, "_file_input", return_value=object()):
+            publisher._wait_for_wechat_editor(page, timeout=1)
+
+        page.get_by_text.assert_not_called()
+
     def test_platform_states_and_publish_methods_are_truthful(self):
         with db.connect() as conn:
             states = {row["code"]: row["capability_status"] for row in conn.execute("SELECT code,capability_status FROM platforms")}
@@ -95,11 +148,12 @@ class DomesticPublishSafetyTests(unittest.TestCase):
         # The validated Douyin publisher is not replaced by the guarded module.
         self.assertIsInstance(get_publisher("douyin"), BrowserPublisher)
 
-    def test_all_platforms_fail_closed_for_unverified_login_and_files(self):
+    def test_acceptance_metadata_no_longer_blocks_but_login_and_files_do(self):
         for code in GUARDED_DOMESTIC_PLATFORMS:
-            with self.subTest(platform=code, case="untested"):
-                platform, account = self.fixture(code, capability="untested")
-                self.assert_code("PLATFORM_UNTESTED", lambda: self.preflight(platform, account))
+            with self.subTest(platform=code, case="acceptance_is_internal_only"):
+                for capability in ("untested", "limited", "failed"):
+                    platform, account = self.fixture(code, capability=capability)
+                    self.assertEqual(self.preflight(platform, account)["status"], "ready")
             with self.subTest(platform=code, case="not_logged_in"):
                 platform, account = self.fixture(code, login="login_required")
                 self.assert_code("AUTH_EXPIRED", lambda: self.preflight(platform, account))
@@ -151,7 +205,7 @@ class DomesticPublishSafetyTests(unittest.TestCase):
 
     def test_browser_and_page_failures_never_become_success(self):
         cases = {
-            "target closed": "BROWSER_CRASHED", "locator missing": "PAGE_CHANGED",
+            "target closed": "BROWSER_CRASHED", "locator missing": "ELEMENT_NOT_FOUND",
             "captcha required": "CAPTCHA_REQUIRED", "network timeout": "NETWORK_TIMEOUT",
         }
         for platform in GUARDED_DOMESTIC_PLATFORMS:
@@ -165,8 +219,7 @@ class DomesticPublishSafetyTests(unittest.TestCase):
             platform, account = self.fixture(code)
             scenarios = []
 
-            untested = dict(platform, capability_status="untested")
-            scenarios.append(("平台未验收", "PLATFORM_UNTESTED", lambda p=untested: self.preflight(p, account)))
+            scenarios.append(("登录环境不存在", "AUTH_EXPIRED", lambda: self.preflight(platform, dict(account, browser_profile_path=str(self.root / "missing-profile")))))
             logged_out = dict(account, login_status="login_required")
             scenarios.append(("未登录点击发布", "AUTH_EXPIRED", lambda a=logged_out: self.preflight(platform, a)))
             scenarios.append(("视频不存在", "FILE_NOT_FOUND", lambda: self.preflight(platform, account, video=self.root / "not-found.mp4")))
@@ -179,7 +232,7 @@ class DomesticPublishSafetyTests(unittest.TestCase):
             scenarios.append(("连续点击发布", "DUPLICATE_TASK", lambda: (_ for _ in ()).throw(PublishGuardError("DUPLICATE_TASK"))))
             scenarios.append(("浏览器意外关闭", "BROWSER_CRASHED", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("target closed")))))
             scenarios.append(("登录状态过期", "AUTH_EXPIRED", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("401 login expired")))))
-            scenarios.append(("页面元素缺失", "PAGE_CHANGED", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("locator missing")))))
+            scenarios.append(("页面元素缺失", "ELEMENT_NOT_FOUND", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("locator missing")))))
             scenarios.append(("平台返回失败", "PROCESSING_FAILED", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("processing failed")))))
             scenarios.append(("软件重启任务恢复", "MANUAL_CONFIRM_REQUIRED", lambda: (_ for _ in ()).throw(PublishGuardError("MANUAL_CONFIRM_REQUIRED"))))
             scenarios.append(("验证码或扫码阻塞", "CAPTCHA_REQUIRED", lambda: (_ for _ in ()).throw(map_publish_exception(RuntimeError("captcha required")))))

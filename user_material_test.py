@@ -17,6 +17,7 @@ from subtitle_service import generate_ass_for_shot
 from video_engine import generate_video
 from video_scan import make_thumbnail, probe_video, quick_hash
 from runtime_paths import get_ffmpeg_path, get_ffprobe_path
+from subprocess_utils import background_process_kwargs
 
 
 MATERIAL_ROOT = Path("D:/Video/混剪素材")
@@ -66,6 +67,7 @@ def run(cmd: list[str], timeout: int = 180):
         encoding="utf-8",
         errors="ignore",
         timeout=timeout,
+        **background_process_kwargs(cmd, "user_material_test"),
     )
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "命令执行失败")[-3000:])

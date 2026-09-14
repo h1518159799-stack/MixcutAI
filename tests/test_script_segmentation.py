@@ -1,10 +1,15 @@
 import re
 import unittest
 
-from script_segmentation import PROTECTED_TERMS, smart_segment_text
+from script_segmentation import DEFAULT_REWRITE_PROMPT, PROTECTED_TERMS, smart_segment_text
 
 
 class SmartScriptSegmentationTests(unittest.TestCase):
+    def test_default_rewrite_prompt_contains_required_rules(self):
+        self.assertIn("保留原文核心事实", DEFAULT_REWRITE_PROMPT)
+        self.assertIn("不使用标点符号", DEFAULT_REWRITE_PROMPT)
+        self.assertIn("空格智能断句", DEFAULT_REWRITE_PROMPT)
+
     def test_user_example_preserves_words_and_content(self):
         source = "还要结合洗发水沐浴露护发素或护肤品的定位和功效共同设计"
         result = smart_segment_text(source)

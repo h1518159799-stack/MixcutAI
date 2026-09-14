@@ -60,7 +60,7 @@ def test_release_missing_component_never_falls_back_to_path(tmp_path, kind):
          patch.object(runtime_paths, "EXECUTABLE_DIR", tmp_path), \
          patch.object(runtime_paths, "RESOURCE_DIR", tmp_path / "_internal"), \
          patch.object(runtime_paths.shutil, "which") as which:
-        with pytest.raises(runtime_paths.MediaRuntimeError, match="重新安装"):
+        with pytest.raises(runtime_paths.MediaRuntimeError, match="不存在"):
             runtime_paths._resolve_media_binary(kind)
         which.assert_not_called()
 
@@ -89,6 +89,32 @@ def test_runtime_status_validates_versions_without_exposing_paths(tmp_path):
     assert status["ffprobe"]["version"] == "8.1.2"
     assert "path" not in status["ffmpeg"]
     assert "path" not in status["ffprobe"]
+
+
+def test_missing_runtime_diagnostic_contains_component_and_checked_paths(tmp_path):
+    with patch.object(runtime_paths, "FROZEN", True), \
+         patch.object(runtime_paths, "EXECUTABLE_DIR", tmp_path), \
+         patch.object(runtime_paths, "RESOURCE_DIR", tmp_path / "_internal"):
+        status = runtime_paths.get_media_runtime_status(refresh=True, include_paths=True)
+    assert status["ready"] is False
+    assert status["ffmpeg"]["exists"] is False
+    assert "FFmpeg不存在" in status["ffmpeg"]["error"]
+    assert "runtime" in status["ffmpeg"]["path"]
+    assert status["ffprobe"]["exists"] is False
+    assert "FFprobe不存在" in status["ffprobe"]["error"]
+
+
+def test_runtime_execution_error_reports_path_and_reason(tmp_path):
+    _make_bundle(tmp_path)
+    failure = PermissionError("access denied")
+    with patch.object(runtime_paths, "FROZEN", True), \
+         patch.object(runtime_paths, "EXECUTABLE_DIR", tmp_path), \
+         patch.object(runtime_paths, "RESOURCE_DIR", tmp_path / "_internal"), \
+         patch.object(runtime_paths.subprocess, "run", side_effect=failure):
+        status = runtime_paths.get_media_runtime_status(refresh=True, include_paths=True)
+    assert status["ffmpeg"]["exists"] is True
+    assert status["ffmpeg"]["path"].endswith("ffmpeg.exe")
+    assert "权限或版本错误" in status["ffmpeg"]["error"]
 
 
 def test_public_settings_hide_legacy_media_paths():

@@ -1,0 +1,10 @@
+{
+  "ffmpeg_version": "8.1.2",
+  "url": "https://update.ghwc.cn/runtime/ffmpeg-v8.1.2.zip",
+  "sha256": "6e79189d3280ef45712abac19ecbbad0b04c851f654766c110aef226b24d45eb",
+  "size_bytes": 186402207,
+  "files": {
+    "bin/ffmpeg.exe": "ad8f211bc894755e0061c55ab280ae00e8d3d4f15a8cc4372b24cfa247b5942e",
+    "bin/ffprobe.exe": "9df3b0b5275e830961df6d94e1f7a71121a7abd5ff708e9fec8a0b6084a55015"
+  }
+}

@@ -1,19 +1,105 @@
 import subprocess
 import random
 import json
+import subprocess
+import threading
 from pathlib import Path
 
-from runtime_paths import MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
+from runtime_paths import LOG_DIR, MediaRuntimeError, get_ffmpeg_path, get_ffprobe_path
+from startup_diagnostics import startup_exception, startup_log
 
 from db import APP_DIR, connect, now
 from bgm_service import scan_bgm_folder
-from timeline_engine import TimelineError, build_color_filter, build_timeline_from_shots, render_timeline
+from timeline_engine import (
+    TimelineError, build_color_filter, build_timeline_from_shots, render_timeline,
+)
 from tts_service import audio_duration
 from task_runtime import heartbeat, run_managed_command
 from generation_success_service import on_generation_succeeded
+from subprocess_utils import background_process_kwargs
 
 SEGMENT_W = 1080
 SEGMENT_H = 1920
+
+_GPU_DETECTION_LOCK = threading.RLock()
+_GPU_DETECTION_RESULT: dict | None = None
+_GPU_DETECTION_STARTED = False
+
+
+def _pending_video_acceleration_status() -> dict:
+    try:
+        mode = video_encoder_mode()
+    except Exception:
+        mode = "auto"
+    return {
+        "mode": mode, "current_encoder": "libx264",
+        "current_encoder_label": "检测中", "gpu_model": "检测中",
+        "gpu_memory": "未知", "gpu_vendor": "未知", "gpu_available": False,
+        "nvenc_status": "checking", "hardware_status": {},
+        "fallback_reason": "后台检测中", "available_encoders": [],
+        "detection_pending": True,
+    }
+
+
+def _compute_video_acceleration_status() -> dict:
+    startup_log("gpu_detection_start")
+    try:
+        startup_log("ffmpeg_detection_start")
+        ffmpeg = find_ffmpeg()
+        startup_log("ffmpeg_detection_end", ffmpeg_path=ffmpeg)
+        details = hardware_encoder_details(ffmpeg)
+        selected = details["selected_encoder"]
+        probes = {item["encoder"]: item for item in details["probes"]}
+        labels = {
+            "h264_nvenc": "NVIDIA NVENC (h264_nvenc)",
+            "h264_qsv": "Intel QSV (h264_qsv)",
+            "h264_amf": "AMD AMF (h264_amf)",
+            "libx264": "CPU x264 (libx264)",
+        }
+        result = {
+            "mode": details["mode"], "current_encoder": selected,
+            "current_encoder_label": labels.get(selected, selected),
+            "gpu_model": details["gpu_name"], "gpu_memory": details["gpu_memory"],
+            "gpu_vendor": details["gpu_vendor"], "gpu_available": selected != "libx264",
+            "nvenc_status": "available" if probes.get("h264_nvenc", {}).get("usable") else "unavailable",
+            "hardware_status": probes, "fallback_reason": details["fallback_reason"],
+            "available_encoders": details["encoders"], "detection_pending": False,
+        }
+        startup_log("ffmpeg_detection_end", encoders=details["encoders"], selected_encoder=selected)
+        startup_log("gpu_detection_end", available=result["gpu_available"], gpu_model=result["gpu_model"], selected_encoder=selected)
+        return result
+    except Exception as exc:
+        # Hardware probing is optional. Never let a driver/FFmpeg error kill startup.
+        startup_exception("gpu_detection_error", exc)
+        startup_log("gpu_detection_end", available=False, fallback_reason=str(exc)[:240])
+        return {
+            **_pending_video_acceleration_status(), "current_encoder_label": "CPU x264 (libx264)",
+            "fallback_reason": "硬件检测失败，使用 CPU 编码", "detection_pending": False,
+        }
+
+
+def _run_gpu_detection_once() -> None:
+    global _GPU_DETECTION_RESULT
+    result = _compute_video_acceleration_status()
+    with _GPU_DETECTION_LOCK:
+        _GPU_DETECTION_RESULT = result
+
+
+def start_gpu_detection_once() -> None:
+    """Schedule one non-blocking startup probe; repeated UI calls are no-ops."""
+    global _GPU_DETECTION_STARTED
+    with _GPU_DETECTION_LOCK:
+        if _GPU_DETECTION_STARTED:
+            return
+        _GPU_DETECTION_STARTED = True
+    threading.Thread(target=_run_gpu_detection_once, name="mixcut-gpu-detection", daemon=True).start()
+
+
+def reset_gpu_detection_for_tests() -> None:
+    global _GPU_DETECTION_RESULT, _GPU_DETECTION_STARTED
+    with _GPU_DETECTION_LOCK:
+        _GPU_DETECTION_RESULT = None
+        _GPU_DETECTION_STARTED = False
 
 
 class VideoGenerationError(RuntimeError):
@@ -25,6 +111,195 @@ def find_ffmpeg(configured: str = "") -> str:
         return get_ffmpeg_path()
     except MediaRuntimeError as exc:
         raise VideoGenerationError(str(exc)) from exc
+
+
+def video_encoder_mode() -> str:
+    with connect() as conn:
+        item = conn.execute("SELECT value FROM app_settings WHERE key='video_encoder_mode'").fetchone()
+    mode = str(item["value"] if item else "auto").strip().lower()
+    if mode == "nvenc":  # compatibility with the first acceleration setting
+        mode = "gpu"
+    return mode if mode in {"auto", "cpu", "gpu"} else "auto"
+
+
+def detect_video_encoders(ffmpeg: str) -> list[str]:
+    try:
+        command = [ffmpeg, "-hide_banner", "-encoders"]
+        result = subprocess.run(
+            command,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            **background_process_kwargs(command, "gpu_encoder_list"),
+        )
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        return [name for name in ("h264_nvenc", "hevc_nvenc", "h264_qsv", "h264_amf") if name in output]
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def probe_video_encoder(ffmpeg: str, encoder: str) -> bool:
+    """Check that the advertised encoder can actually open on this machine."""
+    try:
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                   "-i", "color=c=black:s=128x128:r=1", "-frames:v", "1",
+                   "-c:v", encoder, "-f", "null", "-"]
+        result = subprocess.run(
+            command,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            **background_process_kwargs(command, "gpu_encoder_probe"),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def detect_gpu_model() -> str:
+    return detect_gpu_info()["name"]
+
+
+def detect_gpu_info() -> dict:
+    """Best-effort GPU name/vendor/memory detection without requiring a driver SDK."""
+    try:
+        command = ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"]
+        result = subprocess.run(
+            command,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            **background_process_kwargs(command, "gpu_detection"),
+        )
+        line = next((item.strip() for item in (result.stdout or "").splitlines() if item.strip()), "")
+        if line:
+            name, _, memory = [item.strip() for item in line.partition(",")]
+            return {"name": name, "vendor": gpu_vendor(name), "memory": f"{memory} MB" if memory else "未知"}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for command in (
+        ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_VideoController | ForEach-Object { \"$($_.Name)|$($_.AdapterRAM)\" }"],
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+                                    **background_process_kwargs(command, "gpu_cim_detection"))
+            values = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            if values:
+                name, _, raw_memory = values[0].partition("|")
+                try:
+                    memory = f"{int(raw_memory) / 1024 / 1024 / 1024:.1f} GB" if raw_memory else "未知"
+                except ValueError:
+                    memory = "未知"
+                return {"name": name.strip(), "vendor": gpu_vendor(name), "memory": memory}
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return {"name": "未检测到", "vendor": "未知", "memory": "未知"}
+
+
+def gpu_vendor(gpu_name: str) -> str:
+    name = str(gpu_name or "").lower()
+    if "nvidia" in name or "geforce" in name or "quadro" in name:
+        return "NVIDIA"
+    if "intel" in name:
+        return "Intel"
+    if "amd" in name or "radeon" in name:
+        return "AMD"
+    return "未知"
+
+
+def encoder_vendor(encoder: str) -> str:
+    if encoder.endswith("_nvenc"):
+        return "NVIDIA"
+    if encoder.endswith("_qsv"):
+        return "Intel"
+    if encoder.endswith("_amf"):
+        return "AMD"
+    return "CPU"
+
+
+def probe_video_encoder_result(ffmpeg: str, encoder: str) -> tuple[bool, str]:
+    if encoder not in {"h264_nvenc", "h264_qsv", "h264_amf"}:
+        return True, ""
+    try:
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                   "-i", "color=c=black:s=128x128:r=1", "-frames:v", "1",
+                   "-pix_fmt", "yuv420p", "-c:v", encoder, "-f", "null", "-"]
+        result = subprocess.run(
+            command,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            **background_process_kwargs(command, "gpu_encoder_probe"),
+        )
+        if result.returncode == 0:
+            return True, ""
+        lines = [line.strip() for line in (result.stderr or result.stdout or "").splitlines() if line.strip()]
+        detail = next(
+            (line for line in reversed(lines)
+             if "nothing was written" not in line.lower()
+             and any(word in line.lower() for word in ("error", "failed", "function", "driver", "cuda", "capable", "invalid"))),
+            lines[-1] if lines else "硬件编码器初始化失败",
+        )
+        return False, detail[:240]
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)[:240]
+
+
+def hardware_encoder_details(ffmpeg: str, mode: str | None = None) -> dict:
+    selected_mode = str(mode or video_encoder_mode()).lower()
+    if selected_mode == "nvenc":
+        selected_mode = "gpu"
+    gpu = detect_gpu_info()
+    gpu_name = gpu["name"]
+    vendor = gpu["vendor"]
+    listed = detect_video_encoders(ffmpeg)
+    preferred = {
+        "NVIDIA": ["h264_nvenc"],
+        "Intel": ["h264_qsv"],
+        "AMD": ["h264_amf"],
+        "未知": ["h264_nvenc", "h264_qsv", "h264_amf"],
+    }.get(vendor, ["h264_nvenc", "h264_qsv", "h264_amf"])
+    candidates = preferred if selected_mode in {"auto", "gpu"} else []
+    probes = []
+    for encoder in dict.fromkeys(candidates):
+        if encoder not in listed:
+            probes.append({"encoder": encoder, "listed": False, "usable": False, "reason": "FFmpeg未提供该编码器"})
+            continue
+        usable, reason = probe_video_encoder_result(ffmpeg, encoder)
+        probes.append({"encoder": encoder, "listed": True, "usable": usable, "reason": reason})
+        if usable:
+            break
+    selected = next((item["encoder"] for item in probes if item["usable"]), "libx264")
+    failed = next((item for item in probes if item["listed"] and not item["usable"]), None)
+    return {
+        "mode": selected_mode,
+        "gpu_name": gpu_name,
+        "gpu_memory": gpu["memory"],
+        "gpu_vendor": vendor,
+        "encoders": listed,
+        "probes": probes,
+        "selected_encoder": selected,
+        "requested_encoder": (candidates[0] if candidates else "libx264"),
+        "fallback_reason": (failed or {}).get("reason", "") if selected == "libx264" and candidates else "",
+    }
+
+
+def select_video_encoder(ffmpeg: str, mode: str | None = None) -> tuple[str, list[str]]:
+    details = hardware_encoder_details(ffmpeg, mode)
+    return details["selected_encoder"], details["encoders"]
+
+
+def video_acceleration_status() -> dict:
+    start_gpu_detection_once()
+    with _GPU_DETECTION_LOCK:
+        return dict(_GPU_DETECTION_RESULT or _pending_video_acceleration_status())
+
+
+def render_timeline_with_fallback(ffmpeg, timeline, final_path, work_dir, encoder, task_id=0):
+    """Render once with hardware and retry the same timeline with libx264."""
+    try:
+        render_timeline(ffmpeg, timeline, final_path, work_dir, encoder)
+        return encoder, ""
+    except (TimelineError, VideoGenerationError) as gpu_error:
+        if encoder == "libx264":
+            raise
+        reason = str(gpu_error)[:240] or "GPU编码初始化失败"
+        heartbeat(task_id, stage="rendering", step="GPU加速不可用，已自动切换CPU编码，继续生成", progress=45)
+        final_path.unlink(missing_ok=True)
+        render_timeline(ffmpeg, timeline, final_path, work_dir, "libx264")
+        return "libx264", reason
 
 
 def update_task(task_id, **fields):
@@ -399,14 +674,43 @@ def concat_segments(ffmpeg, segments, output_path, work_dir):
 
 def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_root=""):
     ffmpeg = find_ffmpeg()
+    try:
+        from generation_performance import event
+        import time as _perf_time
+        _accel_started = _perf_time.perf_counter()
+        event("external_call_start", 0.0, call="hardware_encoder_details")
+    except ImportError:
+        _accel_started = None
+    acceleration = hardware_encoder_details(ffmpeg)
+    if _accel_started is not None:
+        event("external_call_end", _perf_time.perf_counter() - _accel_started, call="hardware_encoder_details")
+        event("timeline_build_end", 0.0)
+    encoder = acceleration["selected_encoder"]
+    try:
+        from generation_performance import set_encoding, set_hardware
+        set_encoding(encoder)
+        set_hardware(
+            gpu_name=acceleration["gpu_name"],
+            gpu_memory=acceleration["gpu_memory"],
+            gpu_available=encoder != "libx264",
+            requested_encoder=acceleration["requested_encoder"],
+            actual_encoder=encoder,
+            fallback=encoder == "libx264" and bool(acceleration["fallback_reason"]),
+            fallback_reason=acceleration["fallback_reason"],
+        )
+    except ImportError:
+        pass
     # A task owns an immutable material selection.  Never read the template's
     # old editor-preview match here, otherwise every task renders the same clips.
+    _check_started = _perf_time.perf_counter() if _accel_started is not None else None
+    if _accel_started is not None: event("file_ready_check_start")
     shots = load_template_shots(template_id, task_id)
     try:
         ffprobe_path = get_ffprobe_path()
     except MediaRuntimeError as exc:
         raise VideoGenerationError(str(exc)) from exc
     shots = refresh_real_voice_durations(shots, ffprobe_path)
+    if _check_started is not None: event("file_ready_check_end", _perf_time.perf_counter() - _check_started)
     validate_shots(shots)
 
     out_root = Path(output_dir) if output_dir else APP_DIR / "outputs"
@@ -440,7 +744,24 @@ def generate_video(task_id, template_id, ffmpeg_path="", output_dir="", work_roo
     update_task(task_id, status="rendering", current_shot="渲染时间线分镜", progress=45)
     heartbeat(task_id, status="rendering", stage="rendering", step="渲染时间线分镜", progress=45)
     try:
-        render_timeline(ffmpeg, timeline, final_path, work_dir)
+        from generation_performance import measure
+        with measure("ffmpeg_render"):
+            encoder, render_fallback_reason = render_timeline_with_fallback(
+                ffmpeg, timeline, final_path, work_dir, encoder, task_id
+            )
+        if render_fallback_reason:
+            try:
+                from generation_performance import set_encoding, set_hardware
+                set_encoding(encoder)
+                set_hardware(
+                    gpu_name=acceleration["gpu_name"], gpu_available=False,
+                    gpu_memory=acceleration["gpu_memory"],
+                    requested_encoder=acceleration["requested_encoder"],
+                    actual_encoder=encoder, fallback=True,
+                    fallback_reason=render_fallback_reason,
+                )
+            except ImportError:
+                pass
         timing = validate_final_timing(ffmpeg, final_path, timeline)
         (work_dir / "timing_acceptance.json").write_text(
             json.dumps(timing, ensure_ascii=False, indent=2), encoding="utf-8"

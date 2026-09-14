@@ -99,5 +99,5 @@ def show_expiry_reminder(reminder_days: int = 7) -> None:
     if state.valid and state.days_left is not None and state.days_left <= reminder_days:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showwarning("授权即将到期", f"授权将在 {state.days_left} 天后到期，请及时续期", parent=root)
+        messagebox.showwarning("授权即将到期", f"{state.message}，请及时续期", parent=root)
         root.destroy()

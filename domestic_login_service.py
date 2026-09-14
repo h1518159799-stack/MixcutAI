@@ -22,10 +22,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 from browser_profile_service import ensure_profile, find_chromium
 from runtime_paths import BROWSER_PROFILE_DIR, LOG_DIR
+from subprocess_utils import background_process_kwargs
 
 
 SUPPORTED_PLATFORMS = {"xiaohongshu", "wechat_channels"}
 LOGIN_SESSION_TIMEOUT_SECONDS = 15 * 60
+LOGIN_VERIFY_TIMEOUT_SECONDS = 60
 LOGIN_POLL_SECONDS = 2.0
 LOGIN_SUCCESS_GRACE_SECONDS = 2.5
 
@@ -50,6 +52,7 @@ ERROR_MESSAGES = {
     "BROWSER_LAUNCH_FAILED": "无法打开登录浏览器",
     "PROFILE_LOCKED": "该账号登录环境正在使用，请在已打开的窗口中完成登录",
     "LOGIN_TIMEOUT": "等待登录超时，请重新登录",
+    "LOGIN_VERIFY_TIMEOUT": "登录状态确认超时，请重新登录",
     "LOGIN_PAGE_CHANGED": "平台登录页面发生变化，请更新软件后重试",
     "LOGIN_BROWSER_CLOSED": "登录窗口已关闭，尚未完成登录",
     "LOGIN_VERIFY_FAILED": "已完成登录操作，但软件暂时无法确认登录状态",
@@ -88,6 +91,7 @@ class BrowserLoginSession:
     log_path: str = ""
     initial_login_status: str = "not_logged_in"
     close_reason: str = ""
+    verification_started_at: float = 0.0
     stop_event: threading.Event = field(default_factory=threading.Event, repr=False)
     thread: threading.Thread | None = field(default=None, repr=False)
 
@@ -261,12 +265,13 @@ def _find_browser_pid(profile_path: str) -> int:
         "Select-Object -First 1 -ExpandProperty ProcessId"
     )
     try:
+        process_command = ["powershell", "-NoProfile", "-Command", command]
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+            process_command,
             capture_output=True,
             text=True,
             timeout=4,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            **background_process_kwargs(process_command, "browser_pid_detection"),
         )
         return int((result.stdout or "0").strip().splitlines()[0])
     except Exception:
@@ -319,10 +324,10 @@ def authenticated_platform_page(
     if platform == "wechat_channels":
         if "/login" in lowered_url or "登录视频号助手" in text:
             return False
-        cookie_evidence = _WECHAT_AUTH_COOKIES.issubset(names)
-        route_evidence = "/platform" in lowered_url
-        text_evidence = sum(1 for marker in _WECHAT_AUTH_TEXT if marker in text) >= 2
-        return cookie_evidence and (route_evidence or text_evidence)
+        cookie_evidence = bool(names & _WECHAT_AUTH_COOKIES)
+        route_evidence = any(part in lowered_url for part in ("/platform", "/post/", "/live/", "/data/"))
+        text_evidence = any(marker in text for marker in _WECHAT_AUTH_TEXT)
+        return cookie_evidence or route_evidence or text_evidence
     return False
 
 
@@ -456,9 +461,35 @@ def _run_login(session: BrowserLoginSession) -> None:
                         session.close_reason = "browser_closed"
                         break
                     raise
-                if authenticated_platform_page(session.platform, cookies, page.url, session.page_title, text):
+                login_detected = authenticated_platform_page(
+                    session.platform, cookies, page.url, session.page_title, text
+                )
+                _append_log(
+                    session,
+                    "login_detection",
+                    json.dumps({
+                        "cookie_count": len(_cookie_names(cookies, session.platform)),
+                        "authenticated": login_detected,
+                        "url": _safe_url(page.url),
+                        "title": session.page_title[:160],
+                    }, ensure_ascii=False),
+                )
+                if login_detected:
+                    if not session.verification_started_at:
+                        session.verification_started_at = time.time()
                     confirmation_count += 1
                     _set_state(session, "verifying", "正在确认登录状态", context_status="browser_open")
+                    if time.time() - session.verification_started_at >= LOGIN_VERIFY_TIMEOUT_SECONDS:
+                        session.close_reason = "verification_timeout"
+                        _set_state(
+                            session, "expired", "登录状态确认超时，请重新登录",
+                            "LOGIN_VERIFY_TIMEOUT", context_status="closing",
+                        )
+                        _mark_account(
+                            session.account_id, session.initial_login_status,
+                            "登录状态确认超时，请重新登录", profile_path=session.profile_path,
+                        )
+                        break
                     if confirmation_count < 2:
                         continue
                     # Commit first.  Publication capability is intentionally untouched.
@@ -470,7 +501,20 @@ def _run_login(session: BrowserLoginSession) -> None:
                     session.stop_event.wait(LOGIN_SUCCESS_GRACE_SECONDS)
                     session.close_reason = "login_success"
                     break
-                confirmation_count = 0
+                if session.verification_started_at:
+                    if time.time() - session.verification_started_at >= LOGIN_VERIFY_TIMEOUT_SECONDS:
+                        session.close_reason = "verification_timeout"
+                        _set_state(
+                            session, "expired", "登录状态确认超时，请重新登录",
+                            "LOGIN_VERIFY_TIMEOUT", context_status="closing",
+                        )
+                        _mark_account(
+                            session.account_id, session.initial_login_status,
+                            "登录状态确认超时，请重新登录", profile_path=session.profile_path,
+                        )
+                        break
+                else:
+                    confirmation_count = 0
                 code, message = _waiting_message(session.platform, page.url, text)
                 _set_state(session, "waiting_login", message, code, context_status="browser_open")
             if session.stop_event.is_set() and not authenticated:

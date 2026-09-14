@@ -127,7 +127,9 @@ def generate_publish_content(
     current_tags: str = "",
     current_cover_text: str = "",
 ) -> dict[str, Any]:
-    platform = str(platform or "douyin").strip().lower()
+    platform = str(platform or "").strip().lower()
+    if not platform:
+        raise PublishAIError("PLATFORM_REQUIRED", "缺少发布平台参数，请重新选择平台。")
     if platform not in PLATFORM_STRATEGIES:
         raise PublishAIError("PLATFORM_UNSUPPORTED", "当前平台暂不支持AI发布内容生成。")
 

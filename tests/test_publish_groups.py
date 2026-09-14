@@ -98,25 +98,28 @@ class PublishGroupTests(unittest.TestCase):
             "name": "矩阵验收组", "account_ids": [account_a, account_b, account_c, account_d],
         })
         preview = commercial_api.group_publish_preflight(self.payload(group_id))
-        self.assertEqual((preview["total_count"], preview["publishable_count"], preview["blocked_count"]), (4, 1, 3))
-        result = commercial_api.create_group_publish_batch(self.payload(group_id))
-        self.assertEqual(len(result["task_ids"]), 1)
+        self.assertEqual((preview["total_count"], preview["publishable_count"], preview["blocked_count"]), (4, 3, 1))
+        with patch.object(publish_queue, "preflight_publish_check", side_effect=lambda _platform, account, *_args, **_kwargs: {
+            "idempotency_key": f"test-key-{account['id']}", "video_file_hash": "video-hash", "title_hash": "title-hash",
+        }):
+            result = commercial_api.create_group_publish_batch(self.payload(group_id))
+        self.assertEqual(len(result["task_ids"]), 3)
         self.assertEqual(len(result["items"]), 4)
         skipped = {item["account_id"]: item for item in result["items"] if item["status"] == "skipped"}
-        self.assertEqual(skipped[account_b]["error_code"], "PLATFORM_UNTESTED")
         self.assertEqual(skipped[account_c]["error_code"], "AUTH_EXPIRED")
-        self.assertEqual(skipped[account_d]["error_code"], "PLATFORM_FAILED")
         batch = result["batch"]
-        self.assertEqual((batch["total_count"], batch["queued_count"], batch["skipped_count"]), (4, 1, 3))
+        self.assertEqual((batch["total_count"], batch["queued_count"], batch["skipped_count"]), (4, 3, 1))
 
         task_id = result["task_ids"][0]
         with db.connect() as conn:
-            conn.execute("UPDATE publish_channels SET status='success' WHERE publish_task_id=?", (task_id,))
-        publish_queue._finish_task(task_id)
+            for created_task_id in result["task_ids"]:
+                conn.execute("UPDATE publish_channels SET status='success' WHERE publish_task_id=?", (created_task_id,))
+        for created_task_id in result["task_ids"]:
+            publish_queue._finish_task(created_task_id)
         with db.connect() as conn:
             batch = dict(conn.execute("SELECT * FROM publish_group_batches WHERE id=?", (result["batch_id"],)).fetchone())
         self.assertEqual(batch["status"], "partial_success")
-        self.assertEqual((batch["succeeded_count"], batch["skipped_count"]), (1, 3))
+        self.assertEqual((batch["succeeded_count"], batch["skipped_count"]), (3, 1))
 
         db._init_db_impl()  # simulate restart/migration pass
         restored = commercial_api._group_batch_result(result["batch_id"])
@@ -125,7 +128,7 @@ class PublishGroupTests(unittest.TestCase):
         self.assertTrue(duplicate["duplicate"])
         self.assertEqual(duplicate["batch_id"], result["batch_id"])
         with db.connect() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM publish_tasks WHERE group_batch_id=?", (result["batch_id"],)).fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM publish_tasks WHERE group_batch_id=?", (result["batch_id"],)).fetchone()[0], 3)
 
     def test_failure_retry_only_failed_account(self):
         account_a = self.account("douyin", "成功账号")
@@ -154,8 +157,8 @@ class PublishGroupTests(unittest.TestCase):
         self.assertEqual(rows[account_e]["status"], "queued")
         self.assertEqual(rows[account_e]["retry_count"], 1)
 
-    def test_all_blocked_is_persisted_as_all_skipped(self):
-        account_b = self.account("xiaohongshu", "待验收账号", "untested", "logged_in")
+    def test_all_logged_out_is_persisted_as_all_skipped(self):
+        account_b = self.account("xiaohongshu", "需登录账号", "untested", "needs_login")
         group_id = commercial_api.save_account_group({"name": "全部跳过组", "account_ids": [account_b]})
         result = commercial_api.create_group_publish_batch(self.payload(group_id))
         self.assertEqual(result["task_ids"], [])

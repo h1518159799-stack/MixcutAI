@@ -34,7 +34,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 PRODUCT_ID = "mixcut-ai-windows"
 TOKEN_PREFIX = "MXLIC1"
-VALID_TYPES = {"month": 30, "year": 365, "permanent": 0}
+VALID_TYPES = {"day1": 1, "day7": 7, "month": 30, "year": 365, "permanent": 0}
+SHORT_TERM_TYPES = {"day1", "day7"}
+TYPE_LABELS = {"day1": "1天卡", "day7": "7天卡", "month": "月卡", "year": "年卡", "permanent": "永久卡"}
 DATA_DIR = Path(os.environ.get("MIXCUT_DATA_DIR", "/var/lib/mixcut"))
 DB_PATH = DATA_DIR / "licenses.db"
 PRIVATE_KEY_PATH = Path(os.environ.get("MIXCUT_PRIVATE_KEY", "/etc/mixcut/license_private_key.pem"))
@@ -58,6 +60,28 @@ def utc_now() -> datetime:
 
 def iso_utc(value: datetime | None = None) -> str:
     return (value or utc_now()).astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def calculate_expiry(kind: str, activated_at: str, duration_days: int) -> str:
+    """Keep legacy month/year date semantics; short cards use exact UTC hours."""
+    if kind == "permanent":
+        return ""
+    if kind in SHORT_TERM_TYPES:
+        return iso_utc(parse_utc(activated_at) + timedelta(days=int(duration_days)))
+    return (date.today() + timedelta(days=int(duration_days))).isoformat()
+
+
+def expiry_reached(kind: str, expire_date: str, current_time: datetime | None = None) -> bool:
+    if kind == "permanent" or not expire_date:
+        return False
+    if kind in SHORT_TERM_TYPES:
+        return (current_time or utc_now()).astimezone(timezone.utc) >= parse_utc(expire_date)
+    comparison_date = current_time.date() if current_time is not None else date.today()
+    return date.fromisoformat(expire_date) < comparison_date
 
 
 def canonical(payload: dict[str, Any]) -> bytes:
@@ -131,7 +155,7 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 key_hash TEXT NOT NULL UNIQUE,
                 key_hint TEXT NOT NULL,
-                type TEXT NOT NULL CHECK(type IN ('month','year','permanent')),
+                type TEXT NOT NULL CHECK(type IN ('day1','day7','month','year','permanent')),
                 duration_days INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'issued',
                 machine_id TEXT NOT NULL DEFAULT '',
@@ -194,8 +218,68 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_activation_created ON activation_logs(created_at);
             """
         )
+    migrate_license_type_constraint()
+    with connect() as conn:
         ensure_column(conn, "license_keys", "customer_id", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "license_keys", "max_devices", "INTEGER NOT NULL DEFAULT 1")
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("授权数据库完整性检查失败")
+        if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise RuntimeError("授权数据库外键检查失败")
+
+
+def migrate_license_type_constraint() -> None:
+    """Expand the legacy CHECK constraint without changing any existing row values."""
+    if not DB_PATH.exists():
+        return
+    with contextlib.closing(sqlite3.connect(DB_PATH)) as probe:
+        row = probe.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='license_keys'").fetchone()
+        schema_sql = str(row[0] or "") if row else ""
+    if "'day1'" in schema_sql and "'day7'" in schema_sql:
+        return
+
+    backup = DB_PATH.with_name(f"{DB_PATH.stem}.pre-short-license-{utc_now().strftime('%Y%m%d%H%M%S')}{DB_PATH.suffix}")
+    with contextlib.closing(sqlite3.connect(DB_PATH)) as source, contextlib.closing(sqlite3.connect(backup)) as target:
+        source.backup(target)
+        if target.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("授权数据库迁移前备份校验失败")
+
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """CREATE TABLE license_keys_new (
+                id TEXT PRIMARY KEY,key_hash TEXT NOT NULL UNIQUE,key_hint TEXT NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('day1','day7','month','year','permanent')),
+                duration_days INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'issued',
+                machine_id TEXT NOT NULL DEFAULT '',activated_at TEXT NOT NULL DEFAULT '',
+                expire_date TEXT NOT NULL DEFAULT '',unbind_count INTEGER NOT NULL DEFAULT 0,
+                max_unbinds INTEGER NOT NULL DEFAULT 2,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,
+                customer_id TEXT NOT NULL DEFAULT '',max_devices INTEGER NOT NULL DEFAULT 1
+            )"""
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(license_keys)")}
+        ordered = ["id", "key_hash", "key_hint", "type", "duration_days", "status", "machine_id",
+                   "activated_at", "expire_date", "unbind_count", "max_unbinds", "created_at", "updated_at"]
+        select_parts = ordered[:]
+        for name, default in (("customer_id", "''"), ("max_devices", "1")):
+            ordered.append(name)
+            select_parts.append(name if name in columns else default)
+        conn.execute(
+            f"INSERT INTO license_keys_new({','.join(ordered)}) SELECT {','.join(select_parts)} FROM license_keys"
+        )
+        conn.execute("DROP TABLE license_keys")
+        conn.execute("ALTER TABLE license_keys_new RENAME TO license_keys")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_license_machine ON license_keys(machine_id)")
+        conn.commit()
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise RuntimeError("授权数据库迁移后完整性检查失败")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def request_ip() -> str:
@@ -235,6 +319,7 @@ def issue_token(row: sqlite3.Row, machine_id: str) -> str:
         "type": row["type"],
         "machine_id": machine_id,
         "issued_at": iso_utc(),
+        "activated_at": row["activated_at"],
         "expire_date": row["expire_date"],
         "nonce": secrets.token_urlsafe(18),
         "max_devices": int(row["max_devices"] or 1),
@@ -319,7 +404,7 @@ def active_row_for_token(conn: sqlite3.Connection, data: dict[str, Any], machine
             raise ValueError("授权类型无效")
         if kind != "permanent":
             try:
-                date.fromisoformat(expire_date)
+                parse_utc(expire_date) if kind in SHORT_TERM_TYPES else date.fromisoformat(expire_date)
             except ValueError as exc:
                 raise ValueError("授权有效期无效") from exc
         stamp = iso_utc()
@@ -329,12 +414,12 @@ def active_row_for_token(conn: sqlite3.Connection, data: dict[str, Any], machine
                (id,key_hash,key_hint,type,duration_days,status,machine_id,activated_at,expire_date,created_at,updated_at)
                VALUES(?,?,?,?,?,'active',?,?,?,?,?)""",
             (license_id, imported_hash, "IMPRT", kind, VALID_TYPES[kind], machine_id,
-             str(payload.get("issued_at") or stamp), expire_date, stamp, stamp),
+             str(payload.get("activated_at") or payload.get("issued_at") or stamp), expire_date, stamp, stamp),
         )
         row = conn.execute("SELECT * FROM license_keys WHERE id=?", (license_id,)).fetchone()
     if row["status"] in {"frozen", "revoked", "disabled"}:
         raise ValueError("授权已被冻结或停用")
-    if row["status"] == "expired" or (row["type"] != "permanent" and row["expire_date"] and date.fromisoformat(row["expire_date"]) < date.today()):
+    if row["status"] == "expired" or expiry_reached(row["type"], row["expire_date"]):
         conn.execute("UPDATE license_keys SET status='expired',updated_at=? WHERE id=?", (iso_utc(), row["id"]))
         raise ValueError("授权已到期")
     device = upsert_device(conn, row, machine_id, data)
@@ -344,6 +429,8 @@ def active_row_for_token(conn: sqlite3.Connection, data: dict[str, Any], machine
 
 
 def create_card_keys(conn: sqlite3.Connection, kind: str, count: int, customer_id: str = "", max_devices: int = 1) -> list[str]:
+    if kind not in VALID_TYPES:
+        raise ValueError("授权类型无效")
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     result: list[str] = []
     for _ in range(max(1, min(1000, int(count)))):
@@ -436,14 +523,14 @@ def activate():
         if not row or row["status"] in {"revoked", "disabled", "expired", "frozen"}:
             log_event(conn, "activate", "denied", row=row, machine_id=machine_id, app_version=app_version, message="invalid_or_frozen")
             raise ValueError("卡密无效、已冻结或已停用")
-        if row["type"] != "permanent" and row["expire_date"] and date.fromisoformat(row["expire_date"]) < date.today():
+        if expiry_reached(row["type"], row["expire_date"]):
             conn.execute("UPDATE license_keys SET status='expired',updated_at=? WHERE id=?", (iso_utc(), row["id"]))
             log_event(conn, "activate", "denied", row=row, machine_id=machine_id, app_version=app_version, message="expired")
             raise ValueError("授权已到期")
         activated_at = row["activated_at"] or iso_utc()
         expire_date = row["expire_date"]
         if row["type"] != "permanent" and not expire_date:
-            expire_date = (date.today() + timedelta(days=int(row["duration_days"]))).isoformat()
+            expire_date = calculate_expiry(row["type"], activated_at, int(row["duration_days"]))
         conn.execute(
             "UPDATE license_keys SET status='active',activated_at=?,expire_date=?,updated_at=? WHERE id=?",
             (activated_at, expire_date, iso_utc(), row["id"]),
@@ -454,7 +541,8 @@ def activate():
         row = conn.execute("SELECT * FROM license_keys WHERE id=?", (row["id"],)).fetchone()
         log_event(conn, "activate", "success", row=row, device_id=device["id"], machine_id=machine_id, app_version=app_version)
         token = issue_token(row, machine_id)
-    return jsonify(ok=True, data={"status": "active", "license_token": token, "expire_date": row["expire_date"]})
+    return jsonify(ok=True, data={"status": "active", "license_token": token, "type": row["type"],
+                                  "activated_at": row["activated_at"], "expire_date": row["expire_date"]})
 
 
 @app.post("/api/license/check")
@@ -468,7 +556,8 @@ def check_license_api():
         row, device = active_row_for_token(conn, data, machine_id)
         log_event(conn, "check", "success", row=row, device_id=device["id"], machine_id=machine_id, app_version=app_version)
         token = issue_token(row, machine_id)
-    return jsonify(ok=True, data={"status": "active", "license_token": token, "expire_date": row["expire_date"]})
+    return jsonify(ok=True, data={"status": "active", "license_token": token, "type": row["type"],
+                                  "activated_at": row["activated_at"], "expire_date": row["expire_date"]})
 
 
 @app.post("/api/license/deactivate")
@@ -520,6 +609,7 @@ def csrf_token() -> str:
 
 
 app.jinja_env.globals["csrf_token"] = csrf_token
+app.jinja_env.globals["license_type_label"] = lambda value: TYPE_LABELS.get(str(value), str(value))
 
 
 def require_csrf() -> None:
@@ -570,6 +660,8 @@ def dashboard_data() -> dict[str, Any]:
             "customers": conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0],
             "licenses": conn.execute("SELECT COUNT(*) FROM license_keys").fetchone()[0],
             "active": conn.execute("SELECT COUNT(*) FROM license_keys WHERE status='active'").fetchone()[0],
+            "expired": conn.execute("SELECT COUNT(*) FROM license_keys WHERE status='expired'").fetchone()[0],
+            "frozen": conn.execute("SELECT COUNT(*) FROM license_keys WHERE status='frozen'").fetchone()[0],
             "devices": conn.execute("SELECT COUNT(*) FROM devices WHERE status='active'").fetchone()[0],
         }
         customers = conn.execute("SELECT * FROM customers ORDER BY created_at DESC LIMIT 100").fetchall()

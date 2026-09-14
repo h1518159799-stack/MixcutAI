@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 import tkinter as tk
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
@@ -19,7 +19,7 @@ def application_dir() -> Path:
 
 
 PRIVATE_KEY = application_dir() / "keys" / "license_private_key.pem"
-TYPE_MAP = {"月卡（30天）": "month", "年卡（365天）": "year", "永久授权": "permanent"}
+TYPE_MAP = {"1天卡（24小时）": "day1", "7天卡（7×24小时）": "day7", "月卡（30天）": "month", "年卡（365天）": "year", "永久授权": "permanent"}
 
 
 class KeygenApp:
@@ -100,6 +100,11 @@ class KeygenApp:
             self.expiry_var.set("永久")
             self.expiry_entry.configure(state="disabled")
         else:
+            if license_type in {"day1", "day7"}:
+                days = 1 if license_type == "day1" else 7
+                self.expiry_entry.configure(state="normal")
+                self.expiry_var.set((datetime.now(timezone.utc).replace(microsecond=0) + timedelta(days=days)).isoformat().replace("+00:00", "Z"))
+                return
             days = 365 if license_type == "year" else 30
             self.expiry_entry.configure(state="normal")
             self.expiry_var.set((date.today() + timedelta(days=days)).isoformat())
@@ -116,7 +121,8 @@ class KeygenApp:
     def generate(self) -> None:
         machine = self.machine_var.get().strip().upper()
         license_type = TYPE_MAP[self.type_var.get()]
-        expiry = "" if license_type == "permanent" else self.expiry_var.get().strip()
+        # Short cards are activated by issuance here; calculate from the exact click time.
+        expiry = "" if license_type == "permanent" or license_type in {"day1", "day7"} else self.expiry_var.get().strip()
         if not PRIVATE_KEY.is_file():
             messagebox.showerror("缺少私钥", f"未找到管理员私钥：\n{PRIVATE_KEY}", parent=self.root)
             return

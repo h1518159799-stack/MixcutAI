@@ -15,44 +15,25 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from db import DB_PATH
 from runtime_paths import DATA_DIR, RESOURCE_DIR, SOURCE_DIR
+from shared.update_manifest import UpdateManifest, UpdateManifestError
 from subprocess_utils import background_process_kwargs
 
 
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_UPDATE_BYTES = 600 * 1024 * 1024
+MAX_UPDATER_BYTES = 128 * 1024 * 1024
 UPDATE_DIR = DATA_DIR / "updates"
 BACKUP_DIR = DATA_DIR / "backups"
 
 
 class UpdateError(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class UpdateManifest:
-    version: str
-    title: str
-    content: str
-    download_url: str
-    sha256: str
-    force_update: bool
-
-    def public_dict(self) -> dict[str, Any]:
-        return {
-            "version": self.version,
-            "title": self.title,
-            "content": self.content,
-            "download_url": self.download_url,
-            "sha256": self.sha256,
-            "force_update": self.force_update,
-        }
 
 
 def current_version() -> str:
@@ -64,7 +45,7 @@ def current_version() -> str:
                 return str(value).strip()
         except (OSError, ValueError, TypeError):
             continue
-    return "1.3.12"
+    return "1.3.27"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -123,26 +104,14 @@ def fetch_update_manifest(url: str, timeout: int = 8) -> UpdateManifest:
     if len(raw) > MAX_MANIFEST_BYTES:
         raise UpdateError("update.json 文件过大")
     try:
-        payload = json.loads(raw.decode("utf-8-sig"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise UpdateError("update.json 格式无效") from exc
-    required = ("version", "title", "content", "download_url", "sha256", "force_update")
-    missing = [key for key in required if key not in payload]
-    if missing:
-        raise UpdateError("update.json 缺少字段：" + ", ".join(missing))
-    sha256 = str(payload["sha256"] or "").strip().lower()
-    if len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256):
-        raise UpdateError("update.json 中的 SHA256 无效")
-    download_url = _require_https(payload["download_url"], "新版下载地址")
-    _version_tuple(str(payload["version"]))
-    return UpdateManifest(
-        version=str(payload["version"]).strip().lstrip("v"),
-        title=str(payload["title"] or "发现新版本").strip(),
-        content=str(payload["content"] or "").strip(),
-        download_url=download_url,
-        sha256=sha256,
-        force_update=bool(payload["force_update"]),
-    )
+        manifest = UpdateManifest.from_json_bytes(raw)
+    except UpdateManifestError as exc:
+        raise UpdateError(str(exc)) from exc
+    if manifest.file_size > MAX_UPDATE_BYTES:
+        raise UpdateError("更新清单中的 file_size 超出允许范围")
+    if manifest.updater_artifact and manifest.updater_artifact.file_size > MAX_UPDATER_BYTES:
+        raise UpdateError("更新器文件大小超出允许范围")
+    return manifest
 
 
 def check_for_update(manifest_url: str, local_version: str | None = None, timeout: int = 8) -> dict[str, Any]:
@@ -164,6 +133,15 @@ def sha256_file(path: Path) -> str:
 
 
 DownloadProgress = Callable[[int, int], None]
+UpdateStage = Callable[[str], None]
+
+
+def update_log(message: str) -> None:
+    """Write a short client-side update trace without exposing credentials."""
+    path = DATA_DIR / "update.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n")
 
 
 def download_update(
@@ -171,10 +149,12 @@ def download_update(
     timeout: int = 60,
     progress_callback: DownloadProgress | None = None,
 ) -> Path:
+    update_log("download_start")
     UPDATE_DIR.mkdir(parents=True, exist_ok=True)
     target = UPDATE_DIR / f"MixcutAI-{manifest.version}.exe"
     partial = target.with_suffix(".exe.part")
-    if target.is_file() and sha256_file(target) == manifest.sha256:
+    if target.is_file() and target.stat().st_size == manifest.size_bytes and sha256_file(target) == manifest.sha256:
+        update_log("download_complete cached=true")
         if progress_callback:
             size = target.stat().st_size
             progress_callback(size, size)
@@ -186,6 +166,8 @@ def download_update(
             content_length = int(response.headers.get("Content-Length") or 0)
             if content_length > MAX_UPDATE_BYTES:
                 raise UpdateError("新版安装文件超过大小限制")
+            if content_length and content_length != manifest.size_bytes:
+                raise UpdateError("\u65b0\u7248\u5b89\u88c5\u6587\u4ef6\u5927\u5c0f\u4e0e update.json \u4e0d\u4e00\u81f4")
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
@@ -205,10 +187,15 @@ def download_update(
         partial.unlink(missing_ok=True)
         raise UpdateError(f"新版下载失败：{exc}") from exc
     actual = sha256_file(partial)
+    if partial.stat().st_size != manifest.size_bytes:
+        partial.unlink(missing_ok=True)
+        raise UpdateError("\u65b0\u7248\u5b89\u88c5\u6587\u4ef6\u5927\u5c0f\u6821\u9a8c\u5931\u8d25")
     if actual != manifest.sha256:
         partial.unlink(missing_ok=True)
         raise UpdateError(f"新版 SHA256 校验失败，期望 {manifest.sha256}，实际 {actual}")
     os.replace(partial, target)
+    update_log(f"download_complete size={target.stat().st_size}")
+    update_log("verify_complete")
     return target
 
 
@@ -224,45 +211,139 @@ def backup_database() -> Path:
         raise UpdateError(f"更新前数据库备份失败：{exc}") from exc
     if not target.is_file() or target.stat().st_size != DB_PATH.stat().st_size:
         raise UpdateError("更新前数据库备份校验失败")
+    update_log(f"backup_complete path={target}")
     return target
 
 
-def updater_executable() -> Path:
+def get_updater_path() -> Path:
+    """Resolve the updater beside the real executable, never relative to cwd."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent / "MixcutUpdater.exe"
     return SOURCE_DIR / "release" / "MixcutUpdater.exe"
 
 
+def updater_executable() -> Path:
+    """Backward-compatible alias for callers and integrations."""
+    return get_updater_path()
+
+
+def ensure_updater(manifest: UpdateManifest) -> Path:
+    """Ensure the updater beside the app matches the signed manifest metadata."""
+    updater = get_updater_path()
+    has_metadata = bool(manifest.updater_url and manifest.updater_sha256 and manifest.updater_size_bytes)
+    if updater.is_file() and not has_metadata:
+        return updater
+    if updater.is_file() and has_metadata:
+        try:
+            if updater.stat().st_size == manifest.updater_size_bytes and sha256_file(updater) == manifest.updater_sha256:
+                return updater
+        except OSError:
+            pass
+    if not has_metadata:
+        raise UpdateError("更新组件缺失，请下载完整客户端后重试")
+
+    # Keep both temporary files beside the final updater so os.replace remains
+    # atomic even when the application is installed on a different drive than
+    # the data/cache directory.
+    updater.parent.mkdir(parents=True, exist_ok=True)
+    partial = updater.with_name("MixcutUpdater.exe.part")
+    staged = updater.with_name("MixcutUpdater.exe.staged")
+    partial.unlink(missing_ok=True)
+    try:
+        with _open_https(manifest.updater_url, 60) as response, partial.open("wb") as output:
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length and content_length != manifest.updater_size_bytes:
+                raise UpdateError("更新器下载大小与清单不一致")
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPDATER_BYTES:
+                    raise UpdateError("更新器文件超过大小限制")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if total != manifest.updater_size_bytes or sha256_file(partial) != manifest.updater_sha256:
+            raise UpdateError("更新器文件校验失败")
+        os.replace(partial, staged)
+        os.replace(staged, updater)
+        if (
+            not updater.is_file()
+            or updater.stat().st_size != manifest.updater_size_bytes
+            or sha256_file(updater) != manifest.updater_sha256
+        ):
+            raise UpdateError("更新器安装后校验失败")
+        return updater
+    except UpdateError:
+        partial.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+        raise
+    except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        partial.unlink(missing_ok=True)
+        staged.unlink(missing_ok=True)
+        raise UpdateError(f"更新器恢复失败：{exc}") from exc
+
+
 def launch_updater(new_exe: Path, manifest: UpdateManifest, database_backup: Path) -> dict[str, str]:
-    updater = updater_executable()
+    updater = get_updater_path()
     if not updater.is_file():
-        raise UpdateError("缺少 MixcutUpdater.exe，请重新安装完整客户端")
+        raise UpdateError("更新组件缺失，请下载完整客户端后重试")
     current_exe = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else SOURCE_DIR / "release" / "MixcutAI.exe"
     if not current_exe.is_file():
         raise UpdateError("找不到当前主程序 EXE")
     log_path = DATA_DIR / "update.log"
+    UPDATE_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_snapshot = UPDATE_DIR / f"update-manifest-{manifest.version}.json"
+    staged_manifest = manifest_snapshot.with_suffix(".json.part")
+    try:
+        staged_manifest.write_text(manifest.to_json(), encoding="utf-8")
+        os.replace(staged_manifest, manifest_snapshot)
+    except OSError as exc:
+        staged_manifest.unlink(missing_ok=True)
+        raise UpdateError(f"无法保存统一更新清单：{exc}") from exc
+    update_log("shutdown_request")
     command = [
         str(updater),
         "--pid", str(os.getpid()),
         "--current", str(current_exe),
         "--new", str(new_exe),
-        "--sha256", manifest.sha256,
+        "--manifest", str(manifest_snapshot),
         "--db-backup", str(database_backup),
         "--log", str(log_path),
     ]
     try:
-        subprocess.Popen(command, cwd=str(current_exe.parent), **background_process_kwargs())
+        process = subprocess.Popen(command, cwd=str(current_exe.parent),
+                                   **background_process_kwargs(command, "launch_updater"))
     except OSError as exc:
+        update_log(f"updater_launch_failed winerror={getattr(exc, 'winerror', None)} error={exc}")
         raise UpdateError(f"无法启动更新器：{exc}") from exc
-    return {"version": manifest.version, "staged_path": str(new_exe), "database_backup": str(database_backup)}
+    update_log(f"updater_started pid={process.pid}")
+    return {
+        "version": manifest.version,
+        "staged_path": str(new_exe),
+        "database_backup": str(database_backup),
+        "updater_pid": str(process.pid),
+    }
 
 
 def stage_and_launch(
     manifest: UpdateManifest,
     progress_callback: DownloadProgress | None = None,
+    status_callback: UpdateStage | None = None,
 ) -> dict[str, str]:
+    if status_callback:
+        status_callback("准备下载更新组件...")
+    ensure_updater(manifest)
+    if status_callback:
+        status_callback("正在下载新版程序...")
     new_exe = download_update(manifest, progress_callback=progress_callback)
+    if status_callback:
+        status_callback("正在备份用户数据...")
     database_backup = backup_database()
+    if status_callback:
+        status_callback("正在通知软件退出...")
     return launch_updater(new_exe, manifest, database_backup)
 
 
@@ -270,8 +351,7 @@ def configured_manifest_url(config: dict[str, Any]) -> str:
     return str(config.get("update_manifest_url") or "").strip()
 
 
-def startup_update_flow(config: dict[str, Any]) -> str:
-    """Return continue, launched, or blocked. Never crashes offline startup."""
+def _startup_update_flow(config: dict[str, Any]) -> str:
     if str(config.get("auto_check_update", "1")).lower() not in ("1", "true", "on", "yes"):
         return "continue"
     url = configured_manifest_url(config)
@@ -283,7 +363,7 @@ def startup_update_flow(config: dict[str, Any]) -> str:
         return "continue"
     if not result["available"]:
         return "continue"
-    manifest = UpdateManifest(**result["manifest"])
+    manifest = UpdateManifest.from_dict(result["manifest"])
     import tkinter as tk
     from tkinter import messagebox
     root = tk.Tk(); root.withdraw()
@@ -301,7 +381,7 @@ def startup_update_flow(config: dict[str, Any]) -> str:
     from tkinter import ttk
     frame = ttk.Frame(progress_root, padding=18)
     frame.pack(fill="both", expand=True)
-    label = ttk.Label(frame, text="正在准备下载…")
+    label = ttk.Label(frame, text="准备更新...")
     label.pack(anchor="w", pady=(0, 10))
     progress = ttk.Progressbar(frame, length=380, mode="determinate", maximum=100)
     progress.pack(fill="x")
@@ -322,12 +402,18 @@ def startup_update_flow(config: dict[str, Any]) -> str:
             progress.configure(mode="indeterminate")
             progress.start(12)
             detail.configure(text=f"已下载 {downloaded / 1048576:.1f} MB")
-        label.configure(text="正在安全下载新版程序，请勿关闭软件")
+        label.configure(text="正在下载新版程序，请勿关闭软件")
         progress_root.update_idletasks()
         progress_root.update()
 
     try:
-        stage_and_launch(manifest, progress_callback=report)
+        def set_stage(text: str) -> None:
+            label.configure(text=text)
+            detail.configure(text="请稍候")
+            progress_root.update_idletasks()
+            progress_root.update()
+
+        stage_and_launch(manifest, progress_callback=report, status_callback=set_stage)
         progress_root.destroy()
         return "launched"
     except UpdateError as exc:
@@ -338,4 +424,10 @@ def startup_update_flow(config: dict[str, Any]) -> str:
         return "blocked" if manifest.force_update else "continue"
 
 
+def startup_update_flow(config: dict[str, Any]) -> str:
+    """Run the optional updater without ever blocking normal application startup."""
+    try:
+        return _startup_update_flow(config)
+    except Exception:
+        return "continue"
 

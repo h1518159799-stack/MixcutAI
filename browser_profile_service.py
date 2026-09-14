@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime_paths import BROWSER_PROFILE_DIR, BUNDLED_CHROMIUM_EXE
+from subprocess_utils import background_process_kwargs
 
 
 CHROMIUM_CANDIDATES = (
@@ -35,6 +36,8 @@ def safe_segment(value: str, fallback: str = "account") -> str:
 
 
 def profile_path(platform_code: str, account_name: str, account_id: int) -> Path:
+    if str(platform_code).lower() == "tiktok":
+        return BROWSER_PROFILE_DIR.parent.parent / "browser_profiles" / "tiktok" / str(int(account_id))
     # Keep the public directory contract stable: {platform}/{account}.
     # Account names are unique inside a platform, so an internal id suffix is
     # unnecessary and would make the directory harder for users to recognise.
@@ -42,9 +45,10 @@ def profile_path(platform_code: str, account_name: str, account_id: int) -> Path
 
 
 def ensure_profile(path: str | Path) -> Path:
-    root = BROWSER_PROFILE_DIR.resolve()
+    tiktok_root = (BROWSER_PROFILE_DIR.parent.parent / "browser_profiles" / "tiktok").resolve()
+    roots = (BROWSER_PROFILE_DIR.resolve(), tiktok_root)
     target = Path(path).expanduser().resolve()
-    if target != root and root not in target.parents:
+    if not any(target == root or root in target.parents for root in roots):
         raise ValueError("浏览器目录不在允许的数据目录内")
     target.mkdir(parents=True, exist_ok=True)
     return target
@@ -61,6 +65,18 @@ def find_chromium() -> Path:
     raise FileNotFoundError("内置 Chromium 缺失，且未找到 Google Chrome 或 Microsoft Edge")
 
 
+def find_system_browser() -> Path:
+    candidates = (Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"), Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"), Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    for command in ("chrome.exe", "msedge.exe"):
+        value = shutil.which(command)
+        if value:
+            return Path(value)
+    raise FileNotFoundError("未找到 Google Chrome 或 Microsoft Edge 正式版")
+
+
 def launch_login(platform: dict[str, Any], account: dict[str, Any]) -> dict[str, str]:
     if str(platform.get("login_type") or "") != "browser_profile":
         raise ValueError("当前平台登录方式暂不支持")
@@ -68,7 +84,7 @@ def launch_login(platform: dict[str, Any], account: dict[str, Any]) -> dict[str,
     if not login_url.startswith("https://"):
         raise ValueError("平台登录地址无效")
     path = ensure_profile(account["browser_profile_path"])
-    browser = find_chromium()
+    browser = find_system_browser()
     command = [
         str(browser),
         f"--user-data-dir={path}",
@@ -78,7 +94,8 @@ def launch_login(platform: dict[str, Any], account: dict[str, Any]) -> dict[str,
         "--new-window",
         login_url,
     ]
-    subprocess.Popen(command, cwd=str(browser.parent), close_fds=True)
+    subprocess.Popen(command, cwd=str(browser.parent), close_fds=True,
+                     **background_process_kwargs(command, "browser_login"))
     return {"browser": str(browser), "profile_path": str(path), "login_url": login_url}
 
 
@@ -150,10 +167,8 @@ def detect_login_status(platform: dict[str, Any], account: dict[str, Any]) -> di
 
 def open_profile_folder(path: str | Path) -> str:
     target = ensure_profile(path)
-    if os.name == "nt":
-        os.startfile(str(target))
-    else:
-        subprocess.Popen(["xdg-open", str(target)], close_fds=True)
+    command = ["explorer.exe", str(target)] if os.name == "nt" else ["xdg-open", str(target)]
+    subprocess.Popen(command, close_fds=True, **background_process_kwargs(command, "open_profile_folder"))
     return str(target)
 
 

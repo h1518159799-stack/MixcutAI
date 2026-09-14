@@ -11,6 +11,19 @@ SEGMENT_H = 1920
 FPS = 30
 
 
+def normalize_video_encoder(value: str | None) -> str:
+    """Return a renderer codec name while keeping legacy CPU behavior."""
+    value = str(value or "libx264").strip().lower()
+    return "h264_nvenc" if value in {"nvenc", "h264_nvenc"} else "libx264"
+
+
+def video_codec_args(encoder: str | None) -> list[str]:
+    codec = normalize_video_encoder(encoder)
+    if codec == "h264_nvenc":
+        return ["-c:v", codec, "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0"]
+    return ["-c:v", codec, "-preset", "veryfast", "-crf", "23"]
+
+
 class TimelineError(RuntimeError):
     pass
 
@@ -297,7 +310,7 @@ def find_pair(items, item_type, video_item):
     return candidates[0] if candidates else None
 
 
-def render_timeline(ffmpeg, timeline, output_path, work_dir):
+def render_timeline(ffmpeg, timeline, output_path, work_dir, video_encoder="libx264"):
     """
     第一版 timeline 渲染策略：
     1. 按 video item 逐段生成标准化分镜 MP4
@@ -327,13 +340,13 @@ def render_timeline(ffmpeg, timeline, output_path, work_dir):
         if not audio:
             raise TimelineError(f"{video.get('shot_name') or idx} 缺少 audio item")
         segment_path = work_dir / f"timeline_shot_{idx:03d}.mp4"
-        render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, segment_path)
+        render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, segment_path, video_encoder)
         segments.append(segment_path)
 
     transitions = sorted([i for i in items if i["type"] == "transition"], key=lambda x: x["start_time"])
     merged_path = output_path if not any(i["type"] == "sfx" for i in items) else work_dir / "timeline_without_sfx.mp4"
     if transitions and any(i.get("enabled") for i in transitions):
-        concat_segments_with_transitions(ffmpeg, segments, transitions, merged_path, work_dir)
+        concat_segments_with_transitions(ffmpeg, segments, transitions, merged_path, work_dir, video_encoder)
     else:
         concat_segments(ffmpeg, segments, merged_path, work_dir)
     sfx_items = [i for i in items if i["type"] == "sfx" and i.get("source")]
@@ -483,7 +496,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return str(path)
 
 
-def render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, output_path):
+def render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, output_path, video_encoder="libx264"):
     width = int(timeline.get("width") or SEGMENT_W)
     height = int(timeline.get("height") or SEGMENT_H)
     fps = int(timeline.get("fps") or FPS)
@@ -575,13 +588,7 @@ def render_segment(ffmpeg, timeline, video, audio, subtitle, bgm, title, output_
             f"[voice]apad,atrim=duration={duration:.3f},aresample=async=1:first_pts=0[aout]"
         )
     cmd += ["-filter_complex", ";".join(audio_filters), "-map", "[aout]"]
-    cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
+    cmd += video_codec_args(video_encoder) + [
         "-c:a",
         "aac",
         "-b:a",
@@ -630,7 +637,7 @@ TRANSITION_FILTERS = {
 }
 
 
-def concat_segments_with_transitions(ffmpeg, segments, transitions, output_path, work_dir):
+def concat_segments_with_transitions(ffmpeg, segments, transitions, output_path, work_dir, video_encoder="libx264"):
     if len(segments) < 2:
         return concat_segments(ffmpeg, segments, output_path, work_dir)
     cmd = [ffmpeg, "-y"]
@@ -688,8 +695,8 @@ def concat_segments_with_transitions(ffmpeg, segments, transitions, output_path,
         f"[{audio_label}]apad,atrim=duration={final_duration:.3f},"
         "aresample=async=1:first_pts=0[afinal]"
     )
-    cmd += ["-filter_complex", ";".join(chains), "-map", "[vfinal]", "-map", "[afinal]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-b:a", "192k",
+    cmd += ["-filter_complex", ";".join(chains), "-map", "[vfinal]", "-map", "[afinal]"]
+    cmd += video_codec_args(video_encoder) + ["-c:a", "aac", "-b:a", "192k",
             "-ar", "44100", "-ac", "2", "-t", f"{final_duration:.3f}",
             "-movflags", "+faststart", str(output_path)]
     run_ffmpeg(cmd)
@@ -741,6 +748,11 @@ def mix_sfx(ffmpeg, video_path, sfx_items, output_path):
     cmd += ["-filter_complex", ";".join(filters), "-map", "0:v:0", "-map", "[aout]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
             "-t", f"{target_duration:.3f}", "-movflags", "+faststart", str(output_path)]
-    run_ffmpeg(cmd)
+    try:
+        from generation_performance import measure
+        with measure("audio_mix"):
+            run_ffmpeg(cmd)
+    except ImportError:
+        run_ffmpeg(cmd)
 from subprocess_utils import background_process_kwargs
 from task_runtime import heartbeat, run_managed_command

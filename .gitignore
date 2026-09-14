@@ -97,3 +97,16 @@ vendor/postflow/logs/
 vendor/postflow/media/
 vendor/postflow/videos/
 vendor/postflow/.scratch/
+# Historical validation outputs
+qa/
+artifacts/
+*.png
+*.jpg
+*.jpeg
+*.log
+*.diff
+attachment_decoded.txt
+process_scan_current.txt
+tmp_*
+*.db
+*.sqlite

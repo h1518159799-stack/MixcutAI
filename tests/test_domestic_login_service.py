@@ -81,6 +81,32 @@ class DomesticLoginServiceTests(unittest.TestCase):
             visible_text="发表动态 内容管理 数据中心",
         ))
 
+    def test_wechat_accepts_each_reliable_login_signal(self):
+        route_only = self._cookies([], "channels.weixin.qq.com")
+        self.assertTrue(domestic.authenticated_platform_page(
+            "wechat_channels", route_only,
+            "https://channels.weixin.qq.com/platform/post/list",
+        ))
+        cookie_only = self._cookies(["sessionid"], ".channels.weixin.qq.com")
+        self.assertTrue(domestic.authenticated_platform_page(
+            "wechat_channels", cookie_only,
+            "https://channels.weixin.qq.com/",
+        ))
+        self.assertTrue(domestic.authenticated_platform_page(
+            "wechat_channels", [], "https://channels.weixin.qq.com/",
+            visible_text="视频管理",
+        ))
+
+    def test_wechat_login_shell_rejects_stale_single_cookie(self):
+        cookies = self._cookies(["sessionid"], ".channels.weixin.qq.com")
+        self.assertFalse(domestic.authenticated_platform_page(
+            "wechat_channels", cookies, "https://channels.weixin.qq.com/login.html",
+            visible_text="登录视频号助手",
+        ))
+
+    def test_wechat_confirmation_timeout_is_bounded(self):
+        self.assertEqual(domestic.LOGIN_VERIFY_TIMEOUT_SECONDS, 60)
+
     def test_wechat_stale_cookies_on_login_page_are_not_success(self):
         cookies = self._cookies(["sessionid", "wxuin"], "channels.weixin.qq.com")
         self.assertFalse(domestic.authenticated_platform_page(
@@ -115,6 +141,29 @@ class DomesticLoginServiceTests(unittest.TestCase):
         _platform, first = self._account("xiaohongshu", "一号")
         _platform, second = self._account("xiaohongshu", "二号")
         self.assertNotEqual(first["browser_profile_path"], second["browser_profile_path"])
+
+    def test_two_wechat_accounts_keep_separate_profiles(self):
+        _platform, first = self._account("wechat_channels", "视频号一号")
+        _platform, second = self._account("wechat_channels", "视频号二号")
+        self.assertNotEqual(first["browser_profile_path"], second["browser_profile_path"])
+        self.assertEqual(Path(first["browser_profile_path"]).name, str(first["id"]))
+        self.assertEqual(Path(second["browser_profile_path"]).name, str(second["id"]))
+
+    def test_wechat_relogin_and_restart_keep_canonical_binding(self):
+        platform, account = self._account("wechat_channels", "重新登录账号")
+        domestic._mark_account(account["id"], "login_pending", "", profile_path=account["browser_profile_path"])
+        domestic._mark_account(account["id"], "logged_in", "", profile_path=account["browser_profile_path"], success=True)
+        saved = commercial_api.row(
+            """SELECT a.*,p.code platform_code FROM publish_accounts a
+               JOIN platforms p ON p.id=a.platform_id WHERE a.id=?""",
+            (account["id"],),
+        )
+        domestic.reset_domestic_login_state_for_tests()
+        status = domestic.domestic_login_status(account["id"], saved)
+        self.assertEqual(saved["platform_id"], platform["id"])
+        self.assertEqual(saved["platform_code"], "wechat_channels")
+        self.assertEqual(status["status"], "logged_in")
+        self.assertEqual(status["profile_path"], account["browser_profile_path"])
 
     def test_http_start_returns_while_background_session_remains_alive(self):
         _platform, account = self._account("xiaohongshu")
@@ -204,7 +253,7 @@ class DomesticLoginServiceTests(unittest.TestCase):
 
     def test_error_codes_have_clear_chinese_messages(self):
         expected = {
-            "BROWSER_LAUNCH_FAILED", "PROFILE_LOCKED", "LOGIN_TIMEOUT", "LOGIN_PAGE_CHANGED",
+            "BROWSER_LAUNCH_FAILED", "PROFILE_LOCKED", "LOGIN_TIMEOUT", "LOGIN_VERIFY_TIMEOUT", "LOGIN_PAGE_CHANGED",
             "LOGIN_BROWSER_CLOSED", "LOGIN_VERIFY_FAILED", "NETWORK_ERROR",
         }
         self.assertEqual(expected, set(domestic.ERROR_MESSAGES))

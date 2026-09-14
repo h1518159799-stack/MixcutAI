@@ -51,6 +51,8 @@ journalctl -u mixcut-license -n 100 --no-pager
 
 ```bash
 runuser -u mixcut -- /opt/mixcut/venv/bin/python /opt/mixcut/server/mixcut_admin.py create --type month --count 1
+runuser -u mixcut -- /opt/mixcut/venv/bin/python /opt/mixcut/server/mixcut_admin.py create --type day1 --count 1 --max-devices 1
+runuser -u mixcut -- /opt/mixcut/venv/bin/python /opt/mixcut/server/mixcut_admin.py create --type day7 --count 1 --max-devices 1
 runuser -u mixcut -- /opt/mixcut/venv/bin/python /opt/mixcut/server/mixcut_admin.py create --type year --count 10 --max-devices 2
 ```
 
@@ -61,4 +63,3 @@ runuser -u mixcut -- /opt/mixcut/venv/bin/python /opt/mixcut/server/mixcut_admin
 ```
 
 私钥：`/etc/mixcut/license_private_key.pem`，权限 `0640 root:mixcut`；客户端发布包不得包含该文件。
-

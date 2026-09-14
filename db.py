@@ -14,7 +14,19 @@ APP_DIR = APP_HOME
 THUMB_DIR = DATA_DIR / "thumbnails"
 VOICE_DIR = DATA_DIR / "voices"
 DB_PATH = DATA_DIR / "mixcut.db"
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 26
+
+PRODUCTION_LICENSE_URL = "https://license.ghwc.cn"
+PRODUCTION_UPDATE_MANIFEST_URL = "https://update.ghwc.cn/update.json"
+LEGACY_LICENSE_URLS = (
+    "".join(("https://47-107-104-106.", "ss", "lip.io")),
+    "".join(("https://license.", "xn", "--fiq959cg4n10q.com")),
+)
+LEGACY_UPDATE_URLS = (
+    "".join(("https://47-107-104-106.", "ss", "lip.io/updates/update.json")),
+    "".join(("https://update.", "xn", "--fiq959cg4n10q.com/updates/update.json")),
+    "".join(("https://update.", "xn", "--fiq959cg4n10q.com/update.json")),
+)
 
 
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -116,10 +128,14 @@ def connect():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     THUMB_DIR.mkdir(parents=True, exist_ok=True)
     VOICE_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, factory=ClosingConnection)
+    # Each caller/thread receives a fresh connection; wait for transient
+    # worker/status-write bursts instead of surfacing a lock to the UI.
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -526,6 +542,7 @@ def _init_db_impl():
                 ai_generated_time TEXT NOT NULL DEFAULT '',
                 scheduled_at TEXT NOT NULL DEFAULT '',
                 delete_after_publish INTEGER NOT NULL DEFAULT 0,
+                platform TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending',
                 total_channels INTEGER NOT NULL DEFAULT 0,
                 success_count INTEGER NOT NULL DEFAULT 0,
@@ -543,6 +560,11 @@ def _init_db_impl():
                 publish_task_id INTEGER NOT NULL,
                 account_id INTEGER NOT NULL,
                 platform_id INTEGER NOT NULL,
+                selected_platform TEXT NOT NULL DEFAULT '',
+                account_platform TEXT NOT NULL DEFAULT '',
+                publisher_adapter TEXT NOT NULL DEFAULT '',
+                publish_url TEXT NOT NULL DEFAULT '',
+                error_stage TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'pending',
                 error_message TEXT NOT NULL DEFAULT '',
                 error_code TEXT NOT NULL DEFAULT '',
@@ -762,6 +784,7 @@ def _init_db_impl():
         ensure_column(conn, "oauth_sessions", "completed_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "oauth_sessions", "consumed_at", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "delete_after_publish", "INTEGER NOT NULL DEFAULT 0")
+        ensure_column(conn, "publish_tasks", "platform", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "ai_title", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "ai_description", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_tasks", "ai_hashtags", "TEXT NOT NULL DEFAULT '[]'")
@@ -802,6 +825,24 @@ def _init_db_impl():
         ensure_column(conn, "publish_channels", "video_file_hash", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "title_hash", "TEXT NOT NULL DEFAULT ''")
         ensure_column(conn, "publish_channels", "result_evidence_json", "TEXT NOT NULL DEFAULT '{}'")
+        ensure_column(conn, "publish_channels", "selected_platform", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "account_platform", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "publisher_adapter", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "publish_url", "TEXT NOT NULL DEFAULT ''")
+        ensure_column(conn, "publish_channels", "error_stage", "TEXT NOT NULL DEFAULT ''")
+        # Backfill routing evidence for pre-audit rows without changing their
+        # status or execution history.  Unresolvable legacy rows remain blank.
+        conn.execute(
+            """UPDATE publish_tasks SET platform=(
+                   SELECT p.code FROM publish_channels c JOIN platforms p ON p.id=c.platform_id
+                   WHERE c.publish_task_id=publish_tasks.id ORDER BY c.id LIMIT 1
+               ) WHERE COALESCE(platform,'')=''"""
+        )
+        conn.execute(
+            """UPDATE publish_channels SET selected_platform=(SELECT p.code FROM platforms p WHERE p.id=publish_channels.platform_id),
+                   account_platform=(SELECT p.code FROM platforms p JOIN publish_accounts a ON a.platform_id=p.id WHERE a.id=publish_channels.account_id)
+               WHERE COALESCE(selected_platform,'')='' OR COALESCE(account_platform,'')=''"""
+        )
         if previous_schema_version < 20:
             # A fresh process cannot own a worker from the previous executable.
             # Preserve interrupted work as stalled instead of pretending it is
@@ -975,6 +1016,22 @@ def _init_db_impl():
             conn.execute(
                 "INSERT OR IGNORE INTO app_settings(key, value, updated_at) VALUES(?,?,?)",
                 (key, value, now()),
+            )
+        if previous_schema_version < 25:
+            # Migrate only known retired production endpoints. Explicit
+            # localhost/development overrides remain untouched, and runtime
+            # code never falls back to these legacy domains.
+            license_placeholders = ",".join("?" for _ in LEGACY_LICENSE_URLS)
+            update_placeholders = ",".join("?" for _ in LEGACY_UPDATE_URLS)
+            conn.execute(
+                f"UPDATE app_settings SET value=?,updated_at=? "
+                f"WHERE key='license_server_url' AND value IN ({license_placeholders})",
+                (PRODUCTION_LICENSE_URL, now(), *LEGACY_LICENSE_URLS),
+            )
+            conn.execute(
+                f"UPDATE app_settings SET value=?,updated_at=? "
+                f"WHERE key='update_manifest_url' AND value IN ({update_placeholders})",
+                (PRODUCTION_UPDATE_MANIFEST_URL, now(), *LEGACY_UPDATE_URLS),
             )
         # Only tasks completed after this feature is first installed may start
         # automatic publishing-metadata generation. Existing historical videos
