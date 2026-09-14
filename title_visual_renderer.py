@@ -12,29 +12,48 @@ from pathlib import Path
 from PIL import ImageFont
 
 
-_NUMBER = re.compile(r'(?:[¥￥$€]\s*)?\d+(?:[.,]\d+)*(?:\s*(?:%|％|元|万|亿|条|倍|天|秒|分钟|小时|个))?')
-_KEYWORD = re.compile(r'无算力限制|不限次数|免费[^，。！？\s]{0,4}|一键[^，。！？\s]{0,4}|更高效|零基础')
+_NUMBER = re.compile(r'(?:[¥￥$€]\s*)?\d+(?:[.,]\d+)*(?:\s*(?:亿元|万元|分钟|小时|元|万|亿|条|倍|天|秒|个|%|％))?')
+_KEYWORD = re.compile(r'无算力限制|不限次数|免费|一键|更高效|零基础')
+_PUNCTUATION = re.compile(r'[，。！？；：,!?;:]+\s*')
+_SPACES = re.compile(r'\s+')
+
+
+def _natural_breaks(text):
+    # Decimal separators / currency spacing belong to the numeric token.
+    tokens = [m.span() for m in _NUMBER.finditer(text)]
+    def valid(position):
+        return 0 < position < len(text) and not any(a < position < b for a, b in tokens)
+    punctuation = [m.end() for m in _PUNCTUATION.finditer(text) if valid(m.end())]
+    spaces = [m.end() for m in _SPACES.finditer(text) if valid(m.end())]
+    return punctuation or spaces
 
 
 def title_visual_segments(text, strategy='last_emphasis'):
-    """Return ordered source slices; concatenation is exactly the input string."""
+    """Only semantic boundaries create layers; source slices stay lossless."""
     text = str(text or '')
     if not text:
         return []
-    match = list(_NUMBER.finditer(text)) or list(_KEYWORD.finditer(text))
-    if match:
-        start, end = match[-1].span()
+    breaks = _natural_breaks(text)
+    if breaks:
+        start, end = breaks[-1], len(text)
     else:
-        breaks = [m.end() for m in re.finditer(r'[\s，。！？；：,!?;:]+', text) if m.end() < len(text)]
-        start = breaks[-1] if breaks else len(text) // 2 if len(text) > 7 else 0
-        end = len(text)
+        match = list(_NUMBER.finditer(text)) or list(_KEYWORD.finditer(text))
+        if match:
+            start, end = match[-1].span()
+        else:
+            # An unknown phrase is one layer, never a mechanical half-sentence.
+            start, end = 0, len(text)
     parts = []
     def add(a, b, role):
         if b > a:
             parts.append(dict(text=text[a:b], start=a, end=b, role=role))
-    if strategy == 'badge_emphasis' and start > 5:
-        # A badge is an original prefix, never a generated label.
-        badge_end = next((m.end() for m in re.finditer(r'[\s，：, :]', text[:start]) if 2 <= m.end() <= 6), min(4, start))
+    badge_end = None
+    if strategy == 'badge_emphasis':
+        # Only a short, explicitly delimited prefix can become a badge. A single
+        # complete leading clause stays intact, even if that removes the badge.
+        badge_end = next((i for i in _natural_breaks(text[:start])
+                          if 1 < len(text[:i].strip()) <= 6 and text[i:start].strip()), None)
+    if badge_end is not None:
         add(0, badge_end, 'badge')
         add(badge_end, start, 'primary')
     else:
@@ -82,6 +101,10 @@ def _wrap(text, size, width, weight):
             boundaries = [m.end() for m in re.finditer(r'[\s，。！？；：,!?;:]', text[cursor:end])]
             if boundaries and boundaries[-1] >= (end - cursor) * .55:
                 end = cursor + boundaries[-1]
+        for token in _NUMBER.finditer(text):
+            if token.start() < end < token.end():
+                end = token.start() if token.start() > cursor else token.end()
+                break
         chunks.append((cursor, end, text[cursor:end]))
         cursor = end
     return chunks
@@ -107,8 +130,9 @@ def build_title_scene(preset, title, width, height):
     safe_top = height * preset['safe_top']
     safe_end = height * preset['safe_bottom']
     padding = edge * preset['padding']
+    vertical_padding = edge * preset.get('padding_y', preset['padding'])
     available_width = width * preset['safe_width'] - 2 * padding
-    decor_space = 26 * unit
+    decor_space = preset.get('decoration_space', 26) * unit
     gap = edge * preset['line_spacing']
     max_lines = max(preset['max_lines'], sum(s['text'].count('\n') + 1 for s in segments))
     scale = 1.0
@@ -124,19 +148,19 @@ def build_title_scene(preset, title, width, height):
                                  size=size, inset=inset, width=text_width(text, size, style['weight']),
                                  height=size + 2 * inset))
         total = sum(r['height'] for r in rows) + gap * scale * (len(rows) - 1)
-        if len(rows) <= max_lines and total + 2 * padding + decor_space <= safe_end - safe_top:
+        if all(r['width'] + 2 * r['inset'] <= available_width for r in rows) and len(rows) <= max_lines and total + 2 * vertical_padding + decor_space <= safe_end - safe_top:
             break
         scale *= .94
     else:
         raise ValueError('标题过长，无法在安全区域完整排版')
-    panel_height = total + 2 * padding + decor_space
+    panel_height = total + 2 * vertical_padding + decor_space
     nodes = []
     background = preset['background_style']
     if background:
         nodes.append(_rect(safe_left, safe_top, width * preset['safe_width'], panel_height,
                            background['color'], background.get('opacity', 100),
                            background.get('radius', 0) * unit, gradient_to=background.get('gradient_to')))
-    y = safe_top + padding
+    y = safe_top + vertical_padding
     if preset['decoration_style'].get('kind') == 'editorial_rule':
         y += decor_space
     for row in rows:
@@ -152,7 +176,9 @@ def build_title_scene(preset, title, width, height):
                           source=row['source'], start=row['start'], end=row['end'], role=row['role'],
                           font=preset['font'], size=row['size'], color=style['color'], weight=style['weight'],
                           stroke=style['stroke'], outline=style['outline'] * unit * scale,
-                          shadow=style['shadow'] * unit * scale))
+                          shadow=style['shadow'] * unit * scale,
+                          shadow_opacity=style.get('shadow_opacity', 65),
+                          shadow_blur=style.get('shadow_blur', 0) * unit * scale))
         y += row['height'] + gap * scale
     # These are small compositional primitives, selected by configuration, not ID.
     decoration = preset['decoration_style']
@@ -160,14 +186,18 @@ def build_title_scene(preset, title, width, height):
         kind = decoration['kind']
         color = decoration['color']
         length = edge * decoration['width']
+        if decoration.get('emphasis_width_ratio'):
+            emphasis_width = max((n['width'] for n in nodes if n['type'] == 'text' and n['role'] == 'highlight'), default=length)
+            length = emphasis_width * decoration['emphasis_width_ratio']
+        opacity = decoration.get('opacity', 100)
         thickness = max(.5, decoration['thickness'] * unit)
-        left, right, top, bottom = safe_left + padding, width - safe_left - padding, safe_top + padding / 2, safe_top + panel_height - padding / 2
+        left, right, top, bottom = safe_left + padding, width - safe_left - padding, safe_top + vertical_padding / 2, safe_top + panel_height - vertical_padding / 2
         if kind in {'short_rule', 'soft_pill'}:
             nodes.append(_rect((width - length) / 2, bottom - thickness, length, thickness, color,
-                               radius=thickness / 2 if kind == 'soft_pill' else 0, role='decoration'))
+                               radius=thickness / 2 if kind == 'soft_pill' else 0, opacity=opacity, role='decoration'))
         elif kind == 'double_rule':
-            nodes.extend([_rect(left, top, right - left, thickness, color, role='decoration'),
-                          _rect(left, bottom, right - left, thickness, color, opacity=60, role='decoration')])
+            nodes.extend([_rect(left, top, right - left, thickness, color, opacity=opacity, role='decoration'),
+                          _rect(left, bottom, right - left, thickness, color, opacity=opacity * .6, role='decoration')])
         elif kind == 'editorial_rule':
             nodes.append(_rect(left, top + padding / 2, length, thickness, color, role='decoration'))
         elif kind in {'brackets', 'corner'}:
@@ -247,6 +277,15 @@ def scene_events(scene, start, end, effect=''):
             tags = position + (f"\\fn{node['font']}\\fs{node['size']:.3f}\\b{node['weight']}"
                                f"\\1c{ass_color(node['color'])}\\3c{ass_color(node['stroke'])}"
                                f"\\bord{node['outline']:.3f}\\shad{node['shadow']:.3f}\\4c{ass_color('#17191C')}\\4a&H59&")
+            if node.get('shadow_blur', 0) > 0 and node['shadow'] > 0:
+                alpha = round(255 * (1 - node.get('shadow_opacity', 65) / 100))
+                shadow_tags = (f"\\an7\\pos({x + node['shadow']:.3f},{y + node['shadow']:.3f})\\q2"
+                               f"\\fn{node['font']}\\fs{node['size']:.3f}\\b{node['weight']}"
+                               f"\\1c{ass_color(node['stroke'])}\\1a&H{alpha:02X}&"
+                               f"\\3c{ass_color(node['stroke'])}\\3a&H{alpha:02X}&"
+                               f"\\bord{node['shadow_blur']:.3f}\\shad0\\blur{node['shadow_blur']:.3f}")
+                emit(1, shadow_tags, escape_text(node['text']), 'soft_shadow')
+                tags += r'\shad0'
             emit(2, tags, escape_text(node['text']), node['role'])
     return events
 

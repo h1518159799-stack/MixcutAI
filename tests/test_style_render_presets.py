@@ -61,6 +61,52 @@ class CompositeStyleTests(unittest.TestCase):
         pieces = title_visual_segments('新手做短视频一天也能出100条')
         self.assertEqual(next(p['text'] for p in pieces if p['role'] == 'highlight'), '100条')
 
+    def test_semantic_badge_and_numeric_tokens(self):
+        from title_visual_renderer import _wrap
+        for strategy in ('last_emphasis', 'badge_emphasis'):
+            pieces = title_visual_segments(PREVIEW_TITLE, strategy)
+            self.assertEqual([p['text'] for p in pieces], ['有短视频需求就可以用 ', '无算力限制'])
+            self.assertNotIn('badge', [p['role'] for p in pieces])
+        natural = title_visual_segments('商业干货：新手一天也能出100条', 'badge_emphasis')
+        self.assertEqual(''.join(p['text'] for p in natural), '商业干货：新手一天也能出100条')
+        self.assertEqual(title_visual_segments('不能为了标签机械截断中文短语')[0]['text'], '不能为了标签机械截断中文短语')
+        for token in ('100条', '￥99.50', '50%', '1.5万元'):
+            text = '今天只需' + token + '即可使用'
+            rows = _wrap(text, 90, 170, 700)
+            self.assertEqual(''.join(r[2] for r in rows), text)
+            self.assertTrue(any(token in r[2] for r in rows))
+
+    def test_refined_hierarchy_shadow_panel_and_subtitles(self):
+        yellow = get_style_preset('title', 'yellow_white')
+        scene = build_title_scene(yellow, {'text': PREVIEW_TITLE}, 1080, 1920)
+        primary = next(n for n in scene['nodes'] if n['type']=='text' and n['role']=='primary')
+        emphasis = next(n for n in scene['nodes'] if n['type']=='text' and n['role']=='highlight')
+        rule = next(n for n in scene['nodes'] if n['role']=='decoration')
+        self.assertLess(primary['weight'], emphasis['weight'])
+        self.assertTrue(82*.90 <= primary['size'] <= 82*.95)
+        self.assertAlmostEqual(rule['width']/emphasis['width'], .30)
+        self.assertLess(emphasis['shadow_opacity'], 65)
+        self.assertGreater(emphasis['shadow_blur'], 0)
+        tags = '\n'.join(scene_events(scene, '0:00:00.00', '0:00:01.00'))
+        self.assertIn('soft_shadow', tags)
+        self.assertIn(r'\blur', tags)
+        gold = get_style_preset('title', 'black_gold')
+        self.assertNotEqual(gold['primary_style']['color'], gold['highlight_style']['color'])
+        self.assertLess(gold['background_style']['opacity'], 70)
+        # Compare equal semantic rows to isolate the panel padding refinement.
+        roomy = copy.deepcopy(gold)
+        roomy.update(padding_y=.028, decoration_space=26)
+        old = build_title_scene(roomy, {'text': PREVIEW_TITLE}, 1080, 1920)['bounds']
+        new = build_title_scene(gold, {'text': PREVIEW_TITLE}, 1080, 1920)['bounds']
+        ratio = (new['bottom']-new['top'])/(old['bottom']-old['top'])
+        self.assertTrue(.85 <= ratio <= .90)
+        for style_id in ('yellow_black', 'white_dark'):
+            preset = get_style_preset('subtitle', style_id)
+            self.assertTrue(preset['highlight_color'])
+            self.assertLess(preset['background_style']['opacity'], 70)
+            self.assertLessEqual(preset['background_style']['padding'], 9)
+            self.assertLessEqual(preset['background_style']['radius'], 7)
+
     def test_six_compositions_not_color_swaps(self):
         self.assertEqual(TITLE_STYLE_PRESETS[0]['id'], 'legacy')
         self.assertEqual(len(TITLE_STYLE_PRESETS), 7)
