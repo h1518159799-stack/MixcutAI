@@ -229,7 +229,9 @@ def public_settings() -> dict[str, str]:
 
 def style_presets() -> dict:
     from style_presets import TITLE_STYLE_PRESETS, SUBTITLE_STYLE_PRESETS
-    return {'title': TITLE_STYLE_PRESETS, 'subtitle': SUBTITLE_STYLE_PRESETS}
+    from style_presets import TITLE_STYLE_ALIASES, SUBTITLE_STYLE_ALIASES
+    return {'title': TITLE_STYLE_PRESETS, 'subtitle': SUBTITLE_STYLE_PRESETS,
+            'aliases': {'title': TITLE_STYLE_ALIASES, 'subtitle': SUBTITLE_STYLE_ALIASES}}
 
 
 TITLE_TEMPLATE_SCOPES = {"domestic", "overseas"}
@@ -849,8 +851,9 @@ def generate_title_preview(data):
         title = title_config_from_settings({**merged, "title_main": "主标题样式预览"})
     preview_dir = APP_DIR / "data" / "previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    ass_path = preview_dir / "title_preview.ass"
-    output_path = preview_dir / "title_preview.jpg"
+    digest = hashlib.sha256(json.dumps(data or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+    ass_path = preview_dir / f"title_preview_{digest}.ass"
+    output_path = preview_dir / f"title_preview_{digest}.jpg"
     item = {
         "text": title.pop("main", ""),
         "sub_text": title.pop("sub", ""),
@@ -858,13 +861,24 @@ def generate_title_preview(data):
         "end_time": 1,
         **title,
     }
-    render_title_ass(item, {"start_time": 0}, 1, 1080, 1920, ass_path)
+    if merged.get("preview_kind") == "subtitle":
+        from style_presets import get_style_preset
+        from style_preview import PREVIEW_SUBTITLE
+        from title_visual_renderer import ass_header, build_subtitle_scene, scene_events
+        visual = get_style_preset("subtitle", merged.get("subtitle_style"))
+        if visual:
+            scene = build_subtitle_scene(visual, PREVIEW_SUBTITLE, 1080, 1920)
+            ass_path.write_text(ass_header(1080, 1920) + "\n".join(scene_events(scene, "0:00:00.00", "0:00:01.00")) + "\n", encoding="utf-8-sig")
+        else:
+            render_title_ass(item, {"start_time": 0}, 1, 1080, 1920, ass_path)
+    else:
+        render_title_ass(item, {"start_time": 0}, 1, 1080, 1920, ass_path)
     title_filter = f"ass='{ffmpeg_filter_path(ass_path)}'"
     font_dir = str(item.get("font_dir") or "").strip()
     if font_dir and Path(font_dir).is_dir():
         title_filter += f":fontsdir='{ffmpeg_filter_path(font_dir)}'"
     ffmpeg = find_ffmpeg()
-    command = [ffmpeg, "-y", "-f", "lavfi", "-i", "color=c=0xE4EAF4:s=1080x1920:d=1",
+    command = [ffmpeg, "-y", "-f", "lavfi", "-i", ("color=c=0x30383C:s=1080x1920:d=1" if merged.get("title_style", "legacy") != "legacy" or merged.get("preview_kind") == "subtitle" else "color=c=0xE4EAF4:s=1080x1920:d=1"),
                "-vf", title_filter, "-frames:v", "1", "-q:v", "2", str(output_path)]
     proc = subprocess.run(
         command,
@@ -3457,6 +3471,19 @@ class CommercialHandler(SimpleHTTPRequestHandler):
                     path=parsed.path,
                 )
                 return self.json_response({"ok": True, "data": bootstrap()})
+            if parsed.path == "/api/style-preview":
+                from style_preview import render_style_preview
+                query = parse_qs(parsed.query)
+                preview = render_style_preview(query.get("kind", ["title"])[0], query.get("id", ["legacy"])[0],
+                                               APP_DIR / "data" / "previews", find_ffmpeg())
+                payload = preview.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if parsed.path == "/api/style-presets":
                 return self.json_response({"ok": True, "data": style_presets()})
             if parsed.path == "/api/runtime/media":

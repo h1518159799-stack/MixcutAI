@@ -1,126 +1,102 @@
+"""Visual-only template definitions. IDs remain compatible with saved settings."""
+from copy import deepcopy
+
+
+def _title(style_id, name, layout, strategy, primary, accent, *, align='center',
+           background=None, decoration=None, highlight=None, badge=None,
+           stroke='#201C18', outline=1.5, shadow=2, size=92, emphasis=136):
+    return dict(
+        id=style_id, name=name, layout_type=layout, segment_strategy=strategy,
+        font='Microsoft YaHei', safe_width=.88, safe_top=.065, safe_bottom=.44,
+        auto_font_scale=True, max_lines=5, line_break_strategy='punctuation_words_then_chars',
+        alignment=align, line_spacing=.013, padding=.028,
+        primary_style=dict(color=primary, size=size, weight=700, stroke=stroke, outline=outline, shadow=shadow),
+        secondary_style=dict(color=primary, size=66, weight=400, stroke=stroke, outline=outline, shadow=shadow),
+        highlight_style=dict(color=accent, size=emphasis, weight=700, stroke=stroke, outline=outline, shadow=shadow, **(highlight or {})),
+        badge_style=dict(color=accent, size=46, weight=400, stroke=stroke, outline=0, shadow=0, **(badge or {})),
+        background_style=background or {}, decoration_style=decoration or {},
+    )
+
+
 TITLE_STYLE_PRESETS = [
-    {'id':'legacy','name':'原有样式','text_color':'#FFE67A','outline_color':'#000000','outline_width':'1'},
-    {'id':'yellow_white','name':'黄白大字','text_color':'#FFE67A','outline_color':'#191919','outline_width':'3'},
-    {'id':'black_gold','name':'黑金大字','text_color':'#F6D36A','outline_color':'#080808','outline_width':'3'},
-    {'id':'red_white','name':'红白爆款','text_color':'#FF4D4D','outline_color':'#FFFFFF','outline_width':'3'},
-    {'id':'white_black','name':'白字黑边','text_color':'#FFFFFF','outline_color':'#000000','outline_width':'3'},
-    {'id':'blue_white','name':'蓝白科技','text_color':'#75C8FF','outline_color':'#FFFFFF','outline_width':'2'},
-    {'id':'brown_gold','name':'棕金商务','text_color':'#E7C17A','outline_color':'#3B2417','outline_width':'3'},
-    {'id':'black_yellow','name':'黑底黄字','text_color':'#FFE34D','outline_color':'#111111','outline_width':'2'},
-    {'id':'white_black_bg','name':'白底黑字','text_color':'#111111','outline_color':'#FFFFFF','outline_width':'1'},
+    dict(id='legacy', name='原有样式', text_color='#FFE67A', outline_color='#000000', outline_width='1'),
+    _title('yellow_white', '高端黄白冲击', 'double_center', 'last_emphasis', '#FFF5E6', '#F4C75E',
+           stroke='#2C2119', outline=2.8, shadow=4, size=82, emphasis=144,
+           decoration=dict(kind='short_rule', color='#C59136', thickness=5, width=.18)),
+    _title('black_gold', '黑金质感', 'badge_plus_title', 'badge_emphasis', '#D7BC89', '#F1D7A4',
+           align='left', size=82, emphasis=122, outline=.5, shadow=1,
+           background=dict(color='#141414', opacity=90, radius=14, gradient_to=55),
+           badge=dict(background='#28241D', border='#A58B5E', radius=3, padding=12),
+           decoration=dict(kind='double_rule', color='#A58B5E', thickness=1.5, width=.92)),
+    _title('red_white', '红白爆款', 'highlight_block', 'last_emphasis', '#FFF8F1', '#FFF8F1',
+           align='center', size=86, emphasis=112, outline=.6, shadow=2,
+           highlight=dict(background='#B63932', radius=16, padding=18),
+           decoration=dict(kind='corner', color='#B63932', thickness=6, width=.075)),
+    _title('white_black', '极简高级白', 'editorial_left', 'last_emphasis', '#F8F7F2', '#CED9DF',
+           align='left', size=92, emphasis=112, outline=.6, shadow=1,
+           decoration=dict(kind='editorial_rule', color='#CED9DF', thickness=2, width=.16)),
+    _title('blue_white', '蓝白科技', 'tech_frame', 'badge_emphasis', '#F1F7FC', '#75CBE5',
+           align='center', size=84, emphasis=122, outline=.8, shadow=1,
+           background=dict(color='#102738', opacity=78, radius=8),
+           badge=dict(background='#1C3D50', border='#51849A', radius=3, padding=10),
+           decoration=dict(kind='brackets', color='#75CBE5', thickness=3, width=.065)),
+    _title('brown_gold', '奶油棕金', 'soft_card', 'last_emphasis', '#756052', '#60483B',
+           align='center', size=84, emphasis=120, outline=0, shadow=0,
+           background=dict(color='#F2E8D8', opacity=96, radius=34),
+           decoration=dict(kind='soft_pill', color='#BDA47C', thickness=7, width=.14)),
 ]
+
+# Retired color-only IDs resolve to a designed template, never a missing item.
+TITLE_STYLE_ALIASES = {'black_yellow': 'yellow_white', 'white_black_bg': 'brown_gold'}
+SUBTITLE_STYLE_ALIASES = {'yellow_dark': 'white_dark', 'black_yellow': 'highlight'}
+
+
+def _subtitle(style_id, name, *, accent=None, panel=None, block=None, outline=1.5, shadow=1):
+    return dict(id=style_id, name=name, font='Microsoft YaHei', font_size_ratio=.062,
+                text_color='#F8F8F5', stroke_color='#16191D', stroke_width=outline / 1080,
+                shadow=shadow, highlight_color=accent, background_style=panel or {},
+                highlight_style=block or {}, safe_width=.86, margin_bottom=.095)
+
+
 SUBTITLE_STYLE_PRESETS = [
-    {'id':'legacy','name':'原有样式','text_color':'#FFFFFF','outline_color':'#000000','outline_width':'1'},
-    {'id':'white_black','name':'白字黑边','text_color':'#FFFFFF','outline_color':'#000000','outline_width':'3'},
-    {'id':'yellow_black','name':'黄字黑边','text_color':'#FFE67A','outline_color':'#000000','outline_width':'3'},
-    {'id':'white_dark','name':'白字黑底','text_color':'#FFFFFF','outline_color':'#111111','outline_width':'1'},
-    {'id':'yellow_dark','name':'黄字深底','text_color':'#FFE67A','outline_color':'#111111','outline_width':'1'},
-    {'id':'red_white','name':'红字白底','text_color':'#FF4D4D','outline_color':'#FFFFFF','outline_width':'1'},
-    {'id':'blue_white','name':'蓝字白底','text_color':'#4DA6FF','outline_color':'#FFFFFF','outline_width':'1'},
-    {'id':'black_yellow','name':'黑字黄底','text_color':'#111111','outline_color':'#FFE34D','outline_width':'1'},
-    {'id':'highlight','name':'关键词高亮','text_color':'#FFFFFF','outline_color':'#000000','outline_width':'2'},
+    dict(id='legacy', name='原有样式', text_color='#FFFFFF', outline_color='#000000', outline_width='1'),
+    _subtitle('white_black', '电影白字', outline=.8, shadow=3),
+    _subtitle('yellow_black', '黄词强调', accent='#F2CC67', outline=2),
+    _subtitle('white_dark', '极简黑底', panel=dict(color='#14181D', opacity=76, radius=14, padding=16), outline=0),
+    _subtitle('highlight', '标签字幕', accent='#222B2C', block=dict(background='#D7E6CA', radius=7, padding=6), outline=.5),
+    _subtitle('red_white', '高级红白', accent='#E18C81', block=dict(background='#542723', radius=4, padding=6), outline=1),
+    _subtitle('blue_white', '科技蓝白', accent='#7BD5ED', panel=dict(color='#102E40', opacity=70, radius=9, padding=14), outline=.6),
 ]
 
-# Visual presets use the short edge as their reference length. Legacy entries
-# deliberately never participate in this mapping.
-for _preset in TITLE_STYLE_PRESETS:
-    if _preset['id'] != 'legacy':
-        _preset.update(font='Microsoft YaHei', font_weight=700,
-                       font_size_ratio=0.14, stroke_color=_preset['outline_color'],
-                       stroke_width=float(_preset['outline_width']) / 1080,
-                       shadow=0.002, background_type='none',
-                       background_color='#111111', background_opacity=0,
-                       padding=0.02, alignment='center', position='top',
-                       max_width_ratio=0.92)
-        if _preset['id'] in {'black_yellow', 'white_black_bg'}:
-            _preset.update(background_type='band', background_opacity=90,
-                           background_color='#111111' if _preset['id'] == 'black_yellow' else '#FFFFFF')
-for _preset in SUBTITLE_STYLE_PRESETS:
-    if _preset['id'] != 'legacy':
-        _preset.update(font='Microsoft YaHei', font_weight=700,
-                       font_size_ratio=0.072, stroke_color=_preset['outline_color'],
-                       stroke_width=float(_preset['outline_width']) / 1080,
-                       position='bottom', background_opacity=0)
 
-
-def _preset_for(presets, style_id):
-    return next((p for p in presets if p['id'] == style_id and style_id != 'legacy'), None)
+def get_style_preset(kind, style_id):
+    aliases = TITLE_STYLE_ALIASES if kind == 'title' else SUBTITLE_STYLE_ALIASES
+    if not isinstance(style_id, str):
+        return None
+    style_id = aliases.get(style_id, style_id)
+    presets = TITLE_STYLE_PRESETS if kind == 'title' else SUBTITLE_STYLE_PRESETS
+    return next((deepcopy(p) for p in presets if p['id'] == style_id and style_id != 'legacy'), None)
 
 
 def get_title_render_overrides(style_id, video_width, video_height, title=None):
-    preset = _preset_for(TITLE_STYLE_PRESETS, style_id)
+    """A single conversion boundary; an empty result always means original path."""
+    preset = get_style_preset('title', style_id)
     if preset is None:
         return {}
-    width, height = float(video_width), float(video_height)
-    edge = min(width, height)
-    size = edge * preset['font_size_ratio']
-    # Shrink long titles, never truncate/rewrite their content. A conservative
-    # glyph advance also leaves room for outline and shadow inside the safe area.
-    longest = max((0.85 * len(str((title or {}).get(k) or ''))
-                   for k in ('text', 'sub_text')), default=0)
-    stroke = edge * preset['stroke_width']
-    shadow = edge * preset['shadow']
-    if longest:
-        size = min(size, (width * preset['max_width_ratio'] - 2 * (stroke + shadow)) / longest)
-    return dict(font=preset['font'], bold=-1 if preset['font_weight'] >= 600 else 0, font_size=max(1, int(size)),
-                color=preset['text_color'], outline_color=preset['stroke_color'],
-                outline_width=stroke, shadow_color='#191919', shadow_x=shadow,
-                shadow_y=shadow, auto_fit=False,
-                background_enabled=preset['background_type'] == 'band',
-                background_color=preset['background_color'],
-                background_opacity=preset['background_opacity'],
-                background_padding_y=edge * preset['padding'],
-                center=preset['alignment'] == 'center', main_x=50, sub_x=50,
-                main_y=13, sub_y=13 + (edge * preset['font_size_ratio'] * 1.5 / height * 100))
-
-
-def _ass_color(color):
-    value = color.lstrip('#')
-    return '&H00' + value[4:6] + value[2:4] + value[0:2]
+    from title_visual_renderer import build_title_scene
+    return {'visual_scene': build_title_scene(preset, title or {}, video_width, video_height)}
 
 
 def get_subtitle_render_overrides(style_id, video_width, video_height):
-    preset = _preset_for(SUBTITLE_STYLE_PRESETS, style_id)
+    preset = get_style_preset('subtitle', style_id)
     if preset is None:
         return {}
-    edge = min(float(video_width), float(video_height))
-    return dict(Fontname=preset['font'], Fontsize=edge * preset['font_size_ratio'],
-                PrimaryColour=_ass_color(preset['text_color']),
-                OutlineColour=_ass_color(preset['stroke_color']),
-                Outline=edge * preset['stroke_width'], Bold=-1 if preset['font_weight'] >= 600 else 0,
-                BackColour='&HFF000000', BorderStyle=1, Shadow=0,
-                Alignment=2, MarginV=float(video_height) * 0.09375)
+    return {'visual_preset': preset, 'width': video_width, 'height': video_height}
 
 
 def restyle_subtitle_ass(source, output_path, style_id, video_width, video_height):
-    """Restyle the cached ASS at burn-in, without touching any dialogue bytes.
-
-    Existing ASS coordinates (including animation positions) stay intact. Sizes
-    are converted back to that coordinate system for the actual output aspect.
-    """
-    from pathlib import Path
-    import re
     overrides = get_subtitle_render_overrides(style_id, video_width, video_height)
     if not overrides:
         return str(source)
-    content = Path(source).read_text(encoding='utf-8-sig')
-    match = re.search(r'^PlayResY:\s*(\d+)', content, re.M)
-    play_height = int(match.group(1)) if match else 1920
-    scale = play_height / float(video_height)
-    for field in ('Fontsize', 'Outline', 'MarginV'):
-        overrides[field] *= scale
-    lines, fields, in_styles = [], [], False
-    for line in content.splitlines(keepends=True):
-        if line.startswith('['):
-            in_styles = line.strip() == '[V4+ Styles]'
-        if in_styles and line.startswith('Format:'):
-            fields = [value.strip() for value in line.split(':', 1)[1].split(',')]
-        if in_styles and line.startswith('Style:') and fields:
-            ending = '\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
-            values = line.split(':', 1)[1].strip().split(',')
-            if len(values) == len(fields):
-                values = [str(overrides.get(field, value)) for field, value in zip(fields, values)]
-                line = 'Style: ' + ','.join(values) + ending
-        lines.append(line)
-    Path(output_path).write_text(''.join(lines), encoding='utf-8-sig')
-    return str(output_path)
+    from title_visual_renderer import render_subtitle_template
+    return render_subtitle_template(source, output_path, **overrides)
